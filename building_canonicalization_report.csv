@@ -1,0 +1,8 @@
+file_name,source_layer,source_crs,source_features,output_crs,output_geometry,status,message
+ahmedabad_buildings_wards.gpkg,ahmedabad_buildings_wards,EPSG:4326,945662,EPSG:4326,MultiPolygon,ok,non_poly=0
+bengaluru_buildings_wards.gpkg,bengaluru_buildings_wards,Undefined geographic SRS,1636046,EPSG:4326,MultiPolygon,ok,non_poly=0
+chandigarh_buildings_wards.gpkg,chandigarh_buildings_wards,Undefined geographic SRS,165216,EPSG:4326,MultiPolygon,ok,non_poly=0
+chennai_buildings_wards.gpkg,chennai_buildings_wards,Undefined geographic SRS,1102189,EPSG:4326,MultiPolygon,ok,non_poly=0
+delhi_buildings_wards.gpkg,delhi_buildings_wards,Undefined geographic SRS,2397674,EPSG:4326,MultiPolygon,ok,non_poly=0
+kolkata_buildings_wards.gpkg,kolkata_buildings_wards,Undefined geographic SRS,714708,EPSG:4326,MultiPolygon,ok,non_poly=0
+mumbai_buildings_wards.gpkg,mumbai_buildings_wards,Undefined geographic SRS,674141,EPSG:4326,MultiPolygon,ok,non_poly=0

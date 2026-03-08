@@ -1,0 +1,20 @@
+policy_version: 1
+purpose: canonical_crs_policy_for_ingestion
+storage_crs_by_family:
+  wards: EPSG:4326
+  admin_district: EPSG:4326
+  admin_subdistrict: EPSG:4326
+  buildings: EPSG:4326
+  roads_transit: EPSG:4326
+  open_spaces: EPSG:4326
+  lulc_raster: EPSG:32643
+  dem_raster: EPSG:4326
+analysis_crs_by_metric_family:
+  road_network: EPSG:4326
+  built_form: EPSG:4326
+  land_use_open_space: EPSG:4326
+  topographic: EPSG:4326
+  composite: EPSG:4326
+notes:
+  - Canonical storage CRS is explicit per family to avoid undefined-CRS outputs.
+  - Metric engine may reproject per-request internally if a projected local CRS is required for high-precision distance/area calculations.
