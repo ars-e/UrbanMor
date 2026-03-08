@@ -21,7 +21,7 @@ metrics:
     category: 'road_network'
     display_default: true
     unit: 'percent'
-    formula_summary: 'Connected nodes divided by total nodes, expressed as a percentage.'
+    formula_summary: 'Intersection nodes divided by intersection-plus-cul-de-sac nodes, expressed as a percentage.'
     source_layers:
       - 'roads'
     feasibility: 'Medium'
@@ -128,7 +128,7 @@ metrics:
     category: 'road_network'
     display_default: false
     unit: 'ratio'
-    formula_summary: 'Average ratio of network path distance to straight-line distance for sampled OD pairs.'
+    formula_summary: 'Length-weighted mean segment sinuosity (segment length divided by endpoint chord length).'
     source_layers:
       - 'roads'
       - 'routing_graph'
@@ -159,7 +159,7 @@ metrics:
     category: 'road_network'
     display_default: false
     unit: 'km_per_sq_km_by_class'
-    formula_summary: 'Road length per square kilometer split by highway class.'
+    formula_summary: 'Geodesic road length per square kilometer split by highway class.'
     source_layers:
       - 'roads'
       - 'road_class'
@@ -175,7 +175,7 @@ metrics:
     category: 'road_network'
     display_default: false
     unit: 'percent'
-    formula_summary: 'Length share of pedestrian-capable links over total network length.'
+    formula_summary: 'Geodesic length share of pedestrian-capable links over total clipped road length.'
     source_layers:
       - 'roads'
       - 'footway_tags'
@@ -188,7 +188,7 @@ metrics:
     validation_rule: 'value_between_0_and_100'
   - metric_id: 'transit.stop_density'
     label: 'Transit Stop Density'
-    category: 'road_network'
+    category: 'transit'
     display_default: false
     unit: 'stops_per_sq_km'
     formula_summary: 'Transit stop count divided by geometry area in square kilometers.'
@@ -203,10 +203,10 @@ metrics:
     validation_rule: 'value_non_negative'
   - metric_id: 'transit.distance_to_metro_or_rail'
     label: 'Distance to Nearest Metro / Rail'
-    category: 'road_network'
+    category: 'transit'
     display_default: false
     unit: 'meters'
-    formula_summary: 'Average nearest distance from sampled points to metro or rail stations.'
+    formula_summary: 'Average geodesic nearest distance from sampled interior points to metro, rail, or transit stop features.'
     source_layers:
       - 'metro_stations'
       - 'rail_stations'
@@ -220,7 +220,7 @@ metrics:
     validation_rule: 'value_non_negative'
   - metric_id: 'transit.coverage_500m'
     label: 'Transit Coverage (500m buffer)'
-    category: 'road_network'
+    category: 'transit'
     display_default: false
     unit: 'percent'
     formula_summary: 'Share of geometry covered by 500m buffers around transit stops/stations.'
@@ -300,7 +300,7 @@ metrics:
     category: 'built_form'
     display_default: false
     unit: 'index'
-    formula_summary: 'Average local clustering coefficient on the building proximity graph.'
+    formula_summary: 'Average local clustering coefficient on a 60 m building-centroid proximity graph, scaled to 0-100.'
     source_layers:
       - 'building_footprints'
       - 'building_centroids'
@@ -377,7 +377,7 @@ metrics:
     category: 'built_form'
     display_default: false
     unit: 'percent'
-    formula_summary: 'Share of road edge length fronted by building footprints.'
+    formula_summary: 'Proxy share of approximately 20 m road sample points that fall within 15 m of nearby building footprints.'
     source_layers:
       - 'building_footprints'
       - 'roads'
@@ -393,7 +393,7 @@ metrics:
     category: 'built_form'
     display_default: false
     unit: 'ratio_proxy'
-    formula_summary: 'Proxy FAR from footprint area and available building-level tags.'
+    formula_summary: 'Area-weighted proxy FAR using clipped building footprint share and floor-area proxies where available.'
     source_layers:
       - 'building_footprints'
       - 'building_levels_tags'
@@ -532,8 +532,8 @@ metrics:
     label: 'Park & Green Space Density'
     category: 'land_use_open_space'
     display_default: false
-    unit: 'sq_m_per_sq_km'
-    formula_summary: 'Park and green polygon area per square kilometer.'
+    unit: 'hectares_per_sq_km'
+    formula_summary: 'Park and green polygon area in hectares divided by geometry area in square kilometers.'
     source_layers:
       - 'open_space_polygons'
     feasibility: 'Medium'
@@ -548,7 +548,7 @@ metrics:
     category: 'land_use_open_space'
     display_default: false
     unit: 'meters'
-    formula_summary: 'Average nearest distance from sampled points to park polygons.'
+    formula_summary: 'Average geodesic nearest distance from sampled interior points to citywide park polygons.'
     source_layers:
       - 'open_space_polygons'
     feasibility: 'Medium'
@@ -671,7 +671,7 @@ metrics:
     category: 'topographic'
     display_default: false
     unit: 'index_proxy'
-    formula_summary: 'Proxy score combining low elevation, low slope, and water proximity.'
+    formula_summary: 'Percentage of geometry covered by the derived binary flood-risk proxy raster.'
     source_layers:
       - 'dem_raster'
       - 'water_bodies'

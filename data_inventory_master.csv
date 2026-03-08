@@ -287,7 +287,7 @@ output/transport_network_osm/parquet/ahmedabad/metro_entrances.parquet,metro_ent
 output/transport_network_osm/parquet/ahmedabad/metro_lines.parquet,metro_lines.parquet,ahmedabad,roads_transit,transit,osm,PARQUET,0.06591,EPSG:4326,LineString,176,1,ready,,
 output/transport_network_osm/parquet/ahmedabad/metro_stations.parquet,metro_stations.parquet,ahmedabad,roads_transit,transit,osm,PARQUET,0.030992,EPSG:4326,Point|Polygon,33,1,ready,,
 output/transport_network_osm/parquet/ahmedabad/public_transport_platforms.parquet,public_transport_platforms.parquet,ahmedabad,roads_transit,transit,osm,PARQUET,0.034449,EPSG:4326,Point|Polygon,77,1,ready,,
-output/transport_network_osm/parquet/ahmedabad/public_transport_routes.parquet,public_transport_routes.parquet,ahmedabad,roads_transit,transit,osm,PARQUET,0.024272,EPSG:4326,none,0,1,needs_review,unknown_geometry_type,
+output/transport_network_osm/parquet/ahmedabad/public_transport_routes.parquet,public_transport_routes.parquet,ahmedabad,roads_transit,transit,osm,PARQUET,0.024272,EPSG:4326,none,0,1,needs_review,empty_layer,zero_rows_no_geometry
 output/transport_network_osm/parquet/ahmedabad/public_transport_shelters.parquet,public_transport_shelters.parquet,ahmedabad,roads_transit,transit,osm,PARQUET,0.030739,EPSG:4326,Point|Polygon,30,1,ready,,
 output/transport_network_osm/parquet/ahmedabad/public_transport_stations.parquet,public_transport_stations.parquet,ahmedabad,roads_transit,transit,osm,PARQUET,0.035125,EPSG:4326,Point|Polygon,74,1,ready,,
 output/transport_network_osm/parquet/ahmedabad/public_transport_stops.parquet,public_transport_stops.parquet,ahmedabad,roads_transit,transit,osm,PARQUET,0.035338,EPSG:4326,Point,216,1,ready,,
@@ -303,7 +303,7 @@ output/transport_network_osm/parquet/all_cities/metro_entrances.parquet,metro_en
 output/transport_network_osm/parquet/all_cities/metro_lines.parquet,metro_lines.parquet,all_cities,roads_transit,transit,osm,PARQUET,0.441101,EPSG:4326,LineString|LineString Z|MultiLineString|MultiLineString Z,2421,1,ready,,
 output/transport_network_osm/parquet/all_cities/metro_stations.parquet,metro_stations.parquet,all_cities,roads_transit,transit,osm,PARQUET,0.061094,EPSG:4326,Point|Polygon|Polygon Z,493,1,ready,,
 output/transport_network_osm/parquet/all_cities/public_transport_platforms.parquet,public_transport_platforms.parquet,all_cities,roads_transit,transit,osm,PARQUET,0.384482,EPSG:4326,LineString|LineString Z|MultiPolygon|Point|Polygon|Polygon Z,8125,1,ready,,
-output/transport_network_osm/parquet/all_cities/public_transport_routes.parquet,public_transport_routes.parquet,all_cities,roads_transit,transit,osm,PARQUET,0.006243,EPSG:4326,none,0,1,needs_review,unknown_geometry_type,
+output/transport_network_osm/parquet/all_cities/public_transport_routes.parquet,public_transport_routes.parquet,all_cities,roads_transit,transit,osm,PARQUET,0.006243,EPSG:4326,none,0,1,needs_review,empty_layer,zero_rows_no_geometry
 output/transport_network_osm/parquet/all_cities/public_transport_shelters.parquet,public_transport_shelters.parquet,all_cities,roads_transit,transit,osm,PARQUET,0.252052,EPSG:4326,LineString|LineString Z|MultiPolygon Z|Point|Polygon|Polygon Z,4566,1,ready,,
 output/transport_network_osm/parquet/all_cities/public_transport_stations.parquet,public_transport_stations.parquet,all_cities,roads_transit,transit,osm,PARQUET,0.116349,EPSG:4326,Point|Polygon|Polygon Z,1142,1,ready,,
 output/transport_network_osm/parquet/all_cities/public_transport_stops.parquet,public_transport_stops.parquet,all_cities,roads_transit,transit,osm,PARQUET,0.401586,EPSG:4326,Point,11600,1,ready,,
@@ -319,7 +319,7 @@ output/transport_network_osm/parquet/bengaluru/metro_entrances.parquet,metro_ent
 output/transport_network_osm/parquet/bengaluru/metro_lines.parquet,metro_lines.parquet,bengaluru,roads_transit,transit,osm,PARQUET,0.112922,EPSG:4326,LineString,487,1,ready,,
 output/transport_network_osm/parquet/bengaluru/metro_stations.parquet,metro_stations.parquet,bengaluru,roads_transit,transit,osm,PARQUET,0.033644,EPSG:4326,Point|Polygon,75,1,ready,,
 output/transport_network_osm/parquet/bengaluru/public_transport_platforms.parquet,public_transport_platforms.parquet,bengaluru,roads_transit,transit,osm,PARQUET,0.140109,EPSG:4326,LineString|MultiPolygon|Point|Polygon,2644,1,ready,,
-output/transport_network_osm/parquet/bengaluru/public_transport_routes.parquet,public_transport_routes.parquet,bengaluru,roads_transit,transit,osm,PARQUET,0.024272,EPSG:4326,none,0,1,needs_review,unknown_geometry_type,
+output/transport_network_osm/parquet/bengaluru/public_transport_routes.parquet,public_transport_routes.parquet,bengaluru,roads_transit,transit,osm,PARQUET,0.024272,EPSG:4326,none,0,1,needs_review,empty_layer,zero_rows_no_geometry
 output/transport_network_osm/parquet/bengaluru/public_transport_shelters.parquet,public_transport_shelters.parquet,bengaluru,roads_transit,transit,osm,PARQUET,0.102861,EPSG:4326,LineString|Point|Polygon,1540,1,ready,,
 output/transport_network_osm/parquet/bengaluru/public_transport_stations.parquet,public_transport_stations.parquet,bengaluru,roads_transit,transit,osm,PARQUET,0.044135,EPSG:4326,Point|Polygon,173,1,ready,,
 output/transport_network_osm/parquet/bengaluru/public_transport_stops.parquet,public_transport_stops.parquet,bengaluru,roads_transit,transit,osm,PARQUET,0.170466,EPSG:4326,Point,4585,1,ready,,
@@ -331,11 +331,11 @@ output/transport_network_osm/parquet/bengaluru/walkability_access.parquet,walkab
 output/transport_network_osm/parquet/chandigarh/barriers_traps.parquet,barriers_traps.parquet,chandigarh,roads_transit,roads,osm,PARQUET,0.1476,EPSG:4326,LineString|MultiLineString|Point|Polygon,1803,1,ready,,
 output/transport_network_osm/parquet/chandigarh/bridges_tunnels_flyovers.parquet,bridges_tunnels_flyovers.parquet,chandigarh,roads_transit,roads,osm,PARQUET,0.033622,EPSG:4326,LineString,112,1,ready,,
 output/transport_network_osm/parquet/chandigarh/lanes_minor.parquet,lanes_minor.parquet,chandigarh,roads_transit,roads,osm,PARQUET,0.12335,EPSG:4326,LineString|MultiLineString,774,1,ready,,
-output/transport_network_osm/parquet/chandigarh/metro_entrances.parquet,metro_entrances.parquet,chandigarh,roads_transit,transit,osm,PARQUET,0.024283,EPSG:4326,none,0,1,needs_review,unknown_geometry_type,
-output/transport_network_osm/parquet/chandigarh/metro_lines.parquet,metro_lines.parquet,chandigarh,roads_transit,transit,osm,PARQUET,0.024283,EPSG:4326,none,0,1,needs_review,unknown_geometry_type,
-output/transport_network_osm/parquet/chandigarh/metro_stations.parquet,metro_stations.parquet,chandigarh,roads_transit,transit,osm,PARQUET,0.024283,EPSG:4326,none,0,1,needs_review,unknown_geometry_type,
+output/transport_network_osm/parquet/chandigarh/metro_entrances.parquet,metro_entrances.parquet,chandigarh,roads_transit,transit,osm,PARQUET,0.024283,EPSG:4326,none,0,1,needs_review,empty_layer,zero_rows_no_geometry
+output/transport_network_osm/parquet/chandigarh/metro_lines.parquet,metro_lines.parquet,chandigarh,roads_transit,transit,osm,PARQUET,0.024283,EPSG:4326,none,0,1,needs_review,empty_layer,zero_rows_no_geometry
+output/transport_network_osm/parquet/chandigarh/metro_stations.parquet,metro_stations.parquet,chandigarh,roads_transit,transit,osm,PARQUET,0.024283,EPSG:4326,none,0,1,needs_review,empty_layer,zero_rows_no_geometry
 output/transport_network_osm/parquet/chandigarh/public_transport_platforms.parquet,public_transport_platforms.parquet,chandigarh,roads_transit,transit,osm,PARQUET,0.030013,EPSG:4326,LineString|Point|Polygon,25,1,ready,,
-output/transport_network_osm/parquet/chandigarh/public_transport_routes.parquet,public_transport_routes.parquet,chandigarh,roads_transit,transit,osm,PARQUET,0.024283,EPSG:4326,none,0,1,needs_review,unknown_geometry_type,
+output/transport_network_osm/parquet/chandigarh/public_transport_routes.parquet,public_transport_routes.parquet,chandigarh,roads_transit,transit,osm,PARQUET,0.024283,EPSG:4326,none,0,1,needs_review,empty_layer,zero_rows_no_geometry
 output/transport_network_osm/parquet/chandigarh/public_transport_shelters.parquet,public_transport_shelters.parquet,chandigarh,roads_transit,transit,osm,PARQUET,0.031014,EPSG:4326,LineString|Point|Polygon,36,1,ready,,
 output/transport_network_osm/parquet/chandigarh/public_transport_stations.parquet,public_transport_stations.parquet,chandigarh,roads_transit,transit,osm,PARQUET,0.028317,EPSG:4326,Point|Polygon,5,1,ready,,
 output/transport_network_osm/parquet/chandigarh/public_transport_stops.parquet,public_transport_stops.parquet,chandigarh,roads_transit,transit,osm,PARQUET,0.028528,EPSG:4326,Point,25,1,ready,,
@@ -351,7 +351,7 @@ output/transport_network_osm/parquet/chennai/metro_entrances.parquet,metro_entra
 output/transport_network_osm/parquet/chennai/metro_lines.parquet,metro_lines.parquet,chennai,roads_transit,transit,osm,PARQUET,0.066411,EPSG:4326,LineString Z|MultiLineString Z,126,1,ready,,
 output/transport_network_osm/parquet/chennai/metro_stations.parquet,metro_stations.parquet,chennai,roads_transit,transit,osm,PARQUET,0.034347,EPSG:4326,Point|Polygon Z,41,1,ready,,
 output/transport_network_osm/parquet/chennai/public_transport_platforms.parquet,public_transport_platforms.parquet,chennai,roads_transit,transit,osm,PARQUET,0.069784,EPSG:4326,LineString Z|Point|Polygon Z,868,1,ready,,
-output/transport_network_osm/parquet/chennai/public_transport_routes.parquet,public_transport_routes.parquet,chennai,roads_transit,transit,osm,PARQUET,0.024272,EPSG:4326,none,0,1,needs_review,unknown_geometry_type,
+output/transport_network_osm/parquet/chennai/public_transport_routes.parquet,public_transport_routes.parquet,chennai,roads_transit,transit,osm,PARQUET,0.024272,EPSG:4326,none,0,1,needs_review,empty_layer,zero_rows_no_geometry
 output/transport_network_osm/parquet/chennai/public_transport_shelters.parquet,public_transport_shelters.parquet,chennai,roads_transit,transit,osm,PARQUET,0.046296,EPSG:4326,LineString Z|MultiPolygon Z|Point|Polygon Z,257,1,ready,,
 output/transport_network_osm/parquet/chennai/public_transport_stations.parquet,public_transport_stations.parquet,chennai,roads_transit,transit,osm,PARQUET,0.045655,EPSG:4326,Point|Polygon Z,169,1,ready,,
 output/transport_network_osm/parquet/chennai/public_transport_stops.parquet,public_transport_stops.parquet,chennai,roads_transit,transit,osm,PARQUET,0.067412,EPSG:4326,Point,1197,1,ready,,
@@ -367,7 +367,7 @@ output/transport_network_osm/parquet/delhi/metro_entrances.parquet,metro_entranc
 output/transport_network_osm/parquet/delhi/metro_lines.parquet,metro_lines.parquet,delhi,roads_transit,transit,osm,PARQUET,0.216183,EPSG:4326,LineString|MultiLineString,1264,1,ready,,
 output/transport_network_osm/parquet/delhi/metro_stations.parquet,metro_stations.parquet,delhi,roads_transit,transit,osm,PARQUET,0.038484,EPSG:4326,Point|Polygon,214,1,ready,,
 output/transport_network_osm/parquet/delhi/public_transport_platforms.parquet,public_transport_platforms.parquet,delhi,roads_transit,transit,osm,PARQUET,0.129226,EPSG:4326,LineString|Point|Polygon,2622,1,ready,,
-output/transport_network_osm/parquet/delhi/public_transport_routes.parquet,public_transport_routes.parquet,delhi,roads_transit,transit,osm,PARQUET,0.022285,EPSG:4326,none,0,1,needs_review,unknown_geometry_type,
+output/transport_network_osm/parquet/delhi/public_transport_routes.parquet,public_transport_routes.parquet,delhi,roads_transit,transit,osm,PARQUET,0.022285,EPSG:4326,none,0,1,needs_review,empty_layer,zero_rows_no_geometry
 output/transport_network_osm/parquet/delhi/public_transport_shelters.parquet,public_transport_shelters.parquet,delhi,roads_transit,transit,osm,PARQUET,0.116927,EPSG:4326,LineString|Point|Polygon,1951,1,ready,,
 output/transport_network_osm/parquet/delhi/public_transport_stations.parquet,public_transport_stations.parquet,delhi,roads_transit,transit,osm,PARQUET,0.049258,EPSG:4326,Point|Polygon,331,1,ready,,
 output/transport_network_osm/parquet/delhi/public_transport_stops.parquet,public_transport_stops.parquet,delhi,roads_transit,transit,osm,PARQUET,0.122417,EPSG:4326,Point,3025,1,ready,,
@@ -383,7 +383,7 @@ output/transport_network_osm/parquet/kolkata/metro_entrances.parquet,metro_entra
 output/transport_network_osm/parquet/kolkata/metro_lines.parquet,metro_lines.parquet,kolkata,roads_transit,transit,osm,PARQUET,0.051721,EPSG:4326,LineString Z|MultiLineString Z,71,1,ready,,
 output/transport_network_osm/parquet/kolkata/metro_stations.parquet,metro_stations.parquet,kolkata,roads_transit,transit,osm,PARQUET,0.030443,EPSG:4326,Point|Polygon Z,44,1,ready,,
 output/transport_network_osm/parquet/kolkata/public_transport_platforms.parquet,public_transport_platforms.parquet,kolkata,roads_transit,transit,osm,PARQUET,0.043274,EPSG:4326,LineString Z|Point|Polygon Z,277,1,ready,,
-output/transport_network_osm/parquet/kolkata/public_transport_routes.parquet,public_transport_routes.parquet,kolkata,roads_transit,transit,osm,PARQUET,0.024283,EPSG:4326,none,0,1,needs_review,unknown_geometry_type,
+output/transport_network_osm/parquet/kolkata/public_transport_routes.parquet,public_transport_routes.parquet,kolkata,roads_transit,transit,osm,PARQUET,0.024283,EPSG:4326,none,0,1,needs_review,empty_layer,zero_rows_no_geometry
 output/transport_network_osm/parquet/kolkata/public_transport_shelters.parquet,public_transport_shelters.parquet,kolkata,roads_transit,transit,osm,PARQUET,0.03437,EPSG:4326,LineString Z|Point|Polygon Z,65,1,ready,,
 output/transport_network_osm/parquet/kolkata/public_transport_stations.parquet,public_transport_stations.parquet,kolkata,roads_transit,transit,osm,PARQUET,0.038012,EPSG:4326,Point|Polygon Z,111,1,ready,,
 output/transport_network_osm/parquet/kolkata/public_transport_stops.parquet,public_transport_stops.parquet,kolkata,roads_transit,transit,osm,PARQUET,0.043266,EPSG:4326,Point,463,1,ready,,
@@ -399,7 +399,7 @@ output/transport_network_osm/parquet/mumbai/metro_entrances.parquet,metro_entran
 output/transport_network_osm/parquet/mumbai/metro_lines.parquet,metro_lines.parquet,mumbai,roads_transit,transit,osm,PARQUET,0.083843,EPSG:4326,LineString|MultiLineString,297,1,ready,,
 output/transport_network_osm/parquet/mumbai/metro_stations.parquet,metro_stations.parquet,mumbai,roads_transit,transit,osm,PARQUET,0.035182,EPSG:4326,Point|Polygon,86,1,ready,,
 output/transport_network_osm/parquet/mumbai/public_transport_platforms.parquet,public_transport_platforms.parquet,mumbai,roads_transit,transit,osm,PARQUET,0.109856,EPSG:4326,LineString|Point|Polygon,1612,1,ready,,
-output/transport_network_osm/parquet/mumbai/public_transport_routes.parquet,public_transport_routes.parquet,mumbai,roads_transit,transit,osm,PARQUET,0.024272,EPSG:4326,none,0,1,needs_review,unknown_geometry_type,
+output/transport_network_osm/parquet/mumbai/public_transport_routes.parquet,public_transport_routes.parquet,mumbai,roads_transit,transit,osm,PARQUET,0.024272,EPSG:4326,none,0,1,needs_review,empty_layer,zero_rows_no_geometry
 output/transport_network_osm/parquet/mumbai/public_transport_shelters.parquet,public_transport_shelters.parquet,mumbai,roads_transit,transit,osm,PARQUET,0.060627,EPSG:4326,LineString|Point|Polygon,687,1,ready,,
 output/transport_network_osm/parquet/mumbai/public_transport_stations.parquet,public_transport_stations.parquet,mumbai,roads_transit,transit,osm,PARQUET,0.048658,EPSG:4326,Point|Polygon,279,1,ready,,
 output/transport_network_osm/parquet/mumbai/public_transport_stops.parquet,public_transport_stops.parquet,mumbai,roads_transit,transit,osm,PARQUET,0.09427,EPSG:4326,Point,2089,1,ready,,

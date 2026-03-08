@@ -2,23 +2,41 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import MapboxDraw from '@mapbox/mapbox-gl-draw'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import maplibregl, { MapMouseEvent } from 'maplibre-gl'
-import type { Geometry, MultiPolygon, Polygon } from 'geojson'
+import type { FeatureCollection, Geometry, MultiPolygon, Polygon } from 'geojson'
 import type { MapGeoJSONFeature } from 'maplibre-gl'
 
-import { analyse, getAnalyseJob, getCities, getCityMetrics, getCityWards, getCityWardsGeoJSON, getMetaMetrics, getWardMetrics } from './lib/api'
-import type { AnalyseJobResponse, AnalyseResponse, WardMetricResponse, WardsGeoJSON } from './types'
-import { validateAndNormalizeGeometry } from './lib/geometry'
 import {
-  buildDeltaRows,
+  analyse,
+  getAnalyseJob,
+  getCities,
+  getCityMetrics,
+  getCityRoadsGeoJSON,
+  getCityTransitGeoJSON,
+  getCityWards,
+  getCityWardsGeoJSON,
+  getMetaMetrics,
+  getWardMetrics,
+} from './lib/api'
+import { buildHighlightCards, MAP_METRIC_IDS } from './lib/highlights'
+import { validateAndNormalizeGeometry } from './lib/geometry'
+import { areaSqKm, buildSelectedWardAoiGeometry, createBasemapStyle, formatAreaSqKm, serializeViewportBbox, type MapViewport } from './lib/map'
+import {
   buildMetricPanelRows,
-  buildSideBySideRows,
   downloadTextFile,
   formatMetricNumber,
   groupMetricPanelRows,
   makeMetricsExportCsv,
   makeMetricsExportJson,
-  numericMetricMapFromRows,
 } from './lib/metrics'
+import type {
+  AnalyseJobResponse,
+  AnalyseResponse,
+  CityMapLayerGeoJSONResponse,
+  MetricMetaItem,
+  WardGeometryFeature,
+  WardMetricResponse,
+  WardsGeoJSON,
+} from './types'
 
 const DRAW_CLASSES = (MapboxDraw as unknown as {
   constants: {
@@ -38,7 +56,26 @@ DRAW_CLASSES.CONTROL_PREFIX = 'maplibregl-ctrl-'
 DRAW_CLASSES.CONTROL_GROUP = 'maplibregl-ctrl-group'
 DRAW_CLASSES.ATTRIBUTION = 'maplibregl-ctrl-attrib'
 
-const BASEMAP_STYLE = 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json'
+const DEFAULT_METRIC_ID = 'road.intersection_density'
+const CHOROPLETH_COLOR_STOPS = {
+  low: '#f5f1e6',
+  mid: '#f59e0b',
+  high: '#c2410c',
+  max: '#7c2d12',
+}
+
+type PanelSourceType = 'city' | 'ward' | 'selected_wards' | 'drawn_polygon'
+type AutoAnalysisSource = 'selected_wards' | 'drawn_polygon' | null
+type BasemapMode = 'street' | 'satellite'
+
+interface PanelSnapshot {
+  sourceType: PanelSourceType
+  sourceId: string
+  title: string
+  subtitle: string
+  metrics: Record<string, unknown>
+  qualitySummary: Record<string, unknown>
+}
 
 function isJobResponse(value: AnalyseResponse | AnalyseJobResponse): value is AnalyseJobResponse {
   return 'job_id' in value
@@ -51,6 +88,13 @@ function toNumberOrNull(value: unknown): number | null {
   return null
 }
 
+function emptyFeatureCollection<T extends Geometry = Geometry>(): FeatureCollection<T, Record<string, unknown>> {
+  return {
+    type: 'FeatureCollection',
+    features: [],
+  }
+}
+
 function parseWardRows(response?: AnalyseResponse): WardMetricResponse[] {
   if (!response) {
     return []
@@ -60,6 +104,18 @@ function parseWardRows(response?: AnalyseResponse): WardMetricResponse[] {
     return []
   }
   return result.wards as WardMetricResponse[]
+}
+
+function formatElapsed(seconds: number): string {
+  if (seconds <= 0) {
+    return '0s'
+  }
+  if (seconds < 60) {
+    return `${seconds}s`
+  }
+  const mins = Math.floor(seconds / 60)
+  const rem = seconds % 60
+  return `${mins}m ${rem}s`
 }
 
 function computeBounds(geojson: WardsGeoJSON): [[number, number], [number, number]] | null {
@@ -113,25 +169,32 @@ function computeBounds(geojson: WardsGeoJSON): [[number, number], [number, numbe
 
 function buildFillExpression(min: number | null, max: number | null): unknown {
   if (min === null || max === null) {
-    return '#cbd5e1'
+    return '#d6d3d1'
   }
 
   if (Math.abs(max - min) < 1e-12) {
-    return '#2563eb'
+    return CHOROPLETH_COLOR_STOPS.high
   }
 
-  const mid = min + (max - min) / 2
+  const lowerMid = min + (max - min) / 3
+  const upperMid = min + ((max - min) * 2) / 3
   return [
     'interpolate',
     ['linear'],
     ['coalesce', ['to-number', ['get', 'metric_value']], min],
     min,
-    '#dbeafe',
-    mid,
-    '#3b82f6',
+    CHOROPLETH_COLOR_STOPS.low,
+    lowerMid,
+    CHOROPLETH_COLOR_STOPS.mid,
+    upperMid,
+    CHOROPLETH_COLOR_STOPS.high,
     max,
-    '#1e3a8a',
+    CHOROPLETH_COLOR_STOPS.max,
   ]
+}
+
+function isDrawInteractionMode(mode: string): boolean {
+  return mode === 'draw_polygon' || mode === 'direct_select'
 }
 
 function qualityBadgeClass(flag: string): string {
@@ -148,51 +211,78 @@ function qualityBadgeClass(flag: string): string {
 }
 
 function statusBadgeClass(status: string): string {
-  if (status === 'implemented_v1') {
+  if (status === 'implemented' || status === 'implemented_v1') {
     return 'border-emerald-200 bg-emerald-50 text-emerald-700'
   }
-  if (status.startsWith('planned_')) {
-    return 'border-indigo-200 bg-indigo-50 text-indigo-700'
+  if (status === 'planned' || status.startsWith('planned_')) {
+    return 'border-sky-200 bg-sky-50 text-sky-700'
   }
   if (status === 'blocked_data' || status === 'proxy_only') {
     return 'border-amber-200 bg-amber-50 text-amber-800'
   }
+  if (status === 'deprecated_or_revised') {
+    return 'border-rose-200 bg-rose-50 text-rose-700'
+  }
   return 'border-slate-200 bg-slate-100 text-slate-600'
 }
 
-type PanelSourceType = 'ward' | 'custom_polygon'
+function describeAoi(source: PanelSourceType, city: string, selectedFeatures: WardGeometryFeature[], drawnArea: number | null): { title: string; subtitle: string; areaLabel: string } {
+  if (source === 'drawn_polygon') {
+    return {
+      title: 'Drawn area of interest',
+      subtitle: 'Custom geometry analysed automatically after draw or edit.',
+      areaLabel: formatAreaSqKm(drawnArea),
+    }
+  }
 
-interface PanelSnapshot {
-  sourceType: PanelSourceType
-  sourceId: string
-  metrics: Record<string, unknown>
-  qualitySummary: Record<string, unknown>
-}
+  if (source === 'selected_wards') {
+    const lead = selectedFeatures[0]?.properties.ward_name || selectedFeatures[0]?.properties.ward_id || 'Selected wards'
+    return {
+      title: `${selectedFeatures.length} wards combined`,
+      subtitle: `${lead}${selectedFeatures.length > 1 ? ` + ${selectedFeatures.length - 1} more` : ''}`,
+      areaLabel: formatAreaSqKm(areaSqKm(buildSelectedWardAoiGeometry(selectedFeatures))),
+    }
+  }
 
-interface CompareSnapshot extends PanelSnapshot {
-  title: string
+  if (source === 'ward') {
+    const first = selectedFeatures[0]
+    return {
+      title: first?.properties.ward_name || first?.properties.ward_id || 'Selected ward',
+      subtitle: 'Single ward AOI from cached ward metrics.',
+      areaLabel: formatAreaSqKm(areaSqKm(buildSelectedWardAoiGeometry(selectedFeatures))),
+    }
+  }
+
+  return {
+    title: `${city || 'City'} baseline`,
+    subtitle: 'City-wide ward averages. Select wards or draw a polygon for a true AOI.',
+    areaLabel: 'n/a',
+  }
 }
 
 function App() {
   const mapContainerRef = useRef<HTMLDivElement | null>(null)
   const mapRef = useRef<maplibregl.Map | null>(null)
   const drawRef = useRef<MapboxDraw | null>(null)
+  const lastSubmittedAnalysisKeyRef = useRef<string>('')
 
   const [selectedCity, setSelectedCity] = useState<string>('')
   const [selectedWardIds, setSelectedWardIds] = useState<string[]>([])
-  const [selectedWardId, setSelectedWardId] = useState<string>('')
   const [hoverWardId, setHoverWardId] = useState<string>('')
   const [activeMetricId, setActiveMetricId] = useState<string>('')
   const [drawnGeometry, setDrawnGeometry] = useState<Polygon | MultiPolygon | null>(null)
   const [drawnFeatureId, setDrawnFeatureId] = useState<string>('')
   const [drawMode, setDrawMode] = useState<string>('simple_select')
   const [activeJobId, setActiveJobId] = useState<string>('')
-  const [activeMetricPanelSource, setActiveMetricPanelSource] = useState<PanelSourceType>('ward')
-  const [referenceMode, setReferenceMode] = useState<'city_average' | 'reference_ward'>('city_average')
-  const [referenceWardId, setReferenceWardId] = useState<string>('')
-  const [compareLeft, setCompareLeft] = useState<CompareSnapshot | null>(null)
-  const [compareRight, setCompareRight] = useState<CompareSnapshot | null>(null)
+  const [activeAnalysisSource, setActiveAnalysisSource] = useState<AutoAnalysisSource>(null)
+  const [activeAnalysisLabel, setActiveAnalysisLabel] = useState<string>('')
+  const [activeAnalysisKey, setActiveAnalysisKey] = useState<string>('')
   const [exportMessage, setExportMessage] = useState<string>('')
+  const [jobClock, setJobClock] = useState<number>(Date.now())
+  const [basemapMode, setBasemapMode] = useState<BasemapMode>('street')
+  const [showRoadOverlay, setShowRoadOverlay] = useState<boolean>(true)
+  const [showTransitOverlay, setShowTransitOverlay] = useState<boolean>(true)
+  const [mapViewport, setMapViewport] = useState<MapViewport | null>(null)
 
   const syncDrawnState = useCallback(() => {
     const draw = drawRef.current
@@ -216,27 +306,45 @@ function App() {
       setDrawnFeatureId('')
       return
     }
+
     setDrawnGeometry(latest.geometry)
     setDrawnFeatureId(latest.id === undefined ? '' : String(latest.id))
   }, [])
 
-  const clearDrawnGeometry = useCallback(() => {
-    const draw = drawRef.current
-    if (!draw) {
-      setDrawnGeometry(null)
-      setDrawnFeatureId('')
-      setDrawMode('simple_select')
+  const clearAnalysisSource = useCallback((source: AutoAnalysisSource) => {
+    if (activeAnalysisSource !== source) {
       return
     }
+    setActiveJobId('')
+    setActiveAnalysisSource(null)
+    setActiveAnalysisLabel('')
+    setActiveAnalysisKey('')
+  }, [activeAnalysisSource])
 
-    draw.deleteAll()
-    draw.changeMode('simple_select')
+  const clearDrawState = useCallback(() => {
+    const draw = drawRef.current
+    if (draw) {
+      draw.deleteAll()
+      draw.changeMode('simple_select')
+    }
     setDrawnGeometry(null)
     setDrawnFeatureId('')
     setDrawMode('simple_select')
-    setActiveJobId('')
+    clearAnalysisSource('drawn_polygon')
+  }, [clearAnalysisSource])
+
+  const clearWardSelection = useCallback(() => {
+    setSelectedWardIds([])
+    setHoverWardId('')
+    clearAnalysisSource('selected_wards')
+  }, [clearAnalysisSource])
+
+  const clearAllAoi = useCallback(() => {
+    clearDrawState()
+    clearWardSelection()
     setExportMessage('')
-  }, [])
+    lastSubmittedAnalysisKeyRef.current = ''
+  }, [clearDrawState, clearWardSelection])
 
   const activateDrawMode = useCallback(() => {
     const draw = drawRef.current
@@ -245,22 +353,16 @@ function App() {
     }
 
     draw.deleteAll()
+    setSelectedWardIds([])
+    setHoverWardId('')
+    clearAnalysisSource('selected_wards')
     setDrawnGeometry(null)
     setDrawnFeatureId('')
-    setActiveJobId('')
+    setExportMessage('')
+    lastSubmittedAnalysisKeyRef.current = ''
     draw.changeMode('draw_polygon')
     setDrawMode('draw_polygon')
-  }, [])
-
-  const completeDrawMode = useCallback(() => {
-    const draw = drawRef.current
-    if (!draw) {
-      return
-    }
-    draw.changeMode('simple_select')
-    setDrawMode('simple_select')
-    syncDrawnState()
-  }, [syncDrawnState])
+  }, [clearAnalysisSource])
 
   const activateEditMode = useCallback(() => {
     const draw = drawRef.current
@@ -294,7 +396,6 @@ function App() {
     queryFn: () => getCityWards(effectiveCity),
     enabled: Boolean(effectiveCity),
   })
-  const effectiveReferenceWardId = referenceWardId || selectedWardId || wardsQuery.data?.wards?.[0]?.ward_id || ''
 
   const wardsGeoQuery = useQuery({
     queryKey: ['city-wards-geojson', effectiveCity],
@@ -319,34 +420,12 @@ function App() {
     enabled: Boolean(effectiveCity),
   })
 
+  const effectiveSelectedWardId = selectedWardIds.length === 1 ? selectedWardIds[0] : ''
+
   const wardDetailsQuery = useQuery({
-    queryKey: ['ward-details', effectiveCity, selectedWardId],
-    queryFn: () => getWardMetrics(effectiveCity, selectedWardId),
-    enabled: Boolean(effectiveCity && selectedWardId),
-  })
-
-  const referenceWardMetricsQuery = useQuery({
-    queryKey: ['reference-ward-metrics', effectiveCity, effectiveReferenceWardId],
-    queryFn: () => getWardMetrics(effectiveCity, effectiveReferenceWardId),
-    enabled: Boolean(effectiveCity && effectiveReferenceWardId && referenceMode === 'reference_ward'),
-  })
-
-  const selectedCollectionQuery = useQuery({
-    queryKey: ['ward-collection', effectiveCity, selectedWardIds],
-    queryFn: async () => {
-      const response = await analyse({
-        mode: 'wards',
-        city: effectiveCity,
-        ward_ids: selectedWardIds,
-        limit: selectedWardIds.length,
-        run_async: false,
-      })
-      if (isJobResponse(response)) {
-        throw new Error('Expected synchronous ward collection response')
-      }
-      return response
-    },
-    enabled: Boolean(effectiveCity && selectedWardIds.length > 1),
+    queryKey: ['ward-details', effectiveCity, effectiveSelectedWardId],
+    queryFn: () => getWardMetrics(effectiveCity, effectiveSelectedWardId),
+    enabled: Boolean(effectiveCity && effectiveSelectedWardId),
   })
 
   const cityMetricsQuery = useQuery({
@@ -359,8 +438,24 @@ function App() {
     queryKey: ['meta-metrics'],
     queryFn: getMetaMetrics,
   })
-  const effectiveMetricId =
-    activeMetricId || metaMetricsQuery.data?.metrics?.[0]?.metric_id || 'road.intersection_density'
+
+  const mapMetricOptions = useMemo(() => {
+    const allMetrics = metaMetricsQuery.data?.metrics ?? []
+    const preferred = allMetrics.filter((metric) => MAP_METRIC_IDS.includes(metric.metric_id))
+    return preferred.length > 0 ? preferred : allMetrics
+  }, [metaMetricsQuery.data?.metrics])
+
+  useEffect(() => {
+    if (!mapMetricOptions.length) {
+      return
+    }
+    const stillValid = mapMetricOptions.some((metric) => metric.metric_id === activeMetricId)
+    if (!activeMetricId || !stillValid) {
+      setActiveMetricId(mapMetricOptions[0].metric_id)
+    }
+  }, [activeMetricId, mapMetricOptions])
+
+  const effectiveMetricId = activeMetricId || mapMetricOptions[0]?.metric_id || DEFAULT_METRIC_ID
 
   const wardRows = useMemo(() => parseWardRows(cityWardsMetricsQuery.data), [cityWardsMetricsQuery.data])
 
@@ -397,7 +492,7 @@ function App() {
         }
       }),
     }
-  }, [wardsGeoQuery.data, metricByWard])
+  }, [metricByWard, wardsGeoQuery.data])
 
   const metricRange = useMemo(() => {
     const values = geojsonData.features
@@ -414,33 +509,112 @@ function App() {
     }
   }, [geojsonData])
 
-  const geometryValidation = useMemo(
-    () => validateAndNormalizeGeometry(drawnGeometry),
-    [drawnGeometry],
+  const selectedWardFeatures = useMemo(
+    () => geojsonData.features.filter((feature) => selectedWardIds.includes(feature.properties.ward_id)),
+    [geojsonData.features, selectedWardIds],
   )
 
-  const enqueueCustomPolygonMutation = useMutation({
-    mutationFn: async () => {
-      if (!effectiveCity || !geometryValidation.normalizedGeometry || !geometryValidation.isValid) {
-        throw new Error('Select a city and draw a polygon first')
-      }
+  const selectedWardGeometry = useMemo(
+    () => buildSelectedWardAoiGeometry(selectedWardFeatures as WardGeometryFeature[]),
+    [selectedWardFeatures],
+  )
 
+  const geometryValidation = useMemo(() => validateAndNormalizeGeometry(drawnGeometry), [drawnGeometry])
+
+  const currentAoiSource: PanelSourceType = drawnGeometry
+    ? 'drawn_polygon'
+    : selectedWardIds.length > 1
+      ? 'selected_wards'
+      : effectiveSelectedWardId
+        ? 'ward'
+        : 'city'
+
+  const currentAoiDescription = useMemo(
+    () => describeAoi(currentAoiSource, effectiveCity, selectedWardFeatures as WardGeometryFeature[], geometryValidation.areaSqM ? geometryValidation.areaSqM / 1_000_000 : null),
+    [currentAoiSource, effectiveCity, geometryValidation.areaSqM, selectedWardFeatures],
+  )
+
+  const submitAreaAnalysisMutation = useMutation({
+    mutationFn: async (variables: {
+      geometry: Polygon | MultiPolygon
+      source: Exclude<AutoAnalysisSource, null>
+      key: string
+      label: string
+    }) => {
       const response = await analyse({
         mode: 'custom_polygon',
         city: effectiveCity,
-        geometry: geometryValidation.normalizedGeometry as Geometry,
+        geometry: variables.geometry as Geometry,
+        run_async: true,
       })
       if (!isJobResponse(response)) {
-        throw new Error('Expected async response for custom polygon analysis')
+        throw new Error('Expected async response for AOI analysis')
       }
-      return response
+      return { job: response, variables }
     },
-    onSuccess: (data) => {
-      setActiveJobId(data.job_id)
-      setActiveMetricPanelSource('custom_polygon')
+    onSuccess: ({ job, variables }) => {
+      setActiveJobId(job.job_id)
+      setActiveAnalysisSource(variables.source)
+      setActiveAnalysisLabel(variables.label)
+      setActiveAnalysisKey(variables.key)
       setExportMessage('')
     },
   })
+
+  const drawnAnalysisKey = useMemo(() => {
+    if (!effectiveCity || !geometryValidation.normalizedGeometry || !geometryValidation.isValid) {
+      return ''
+    }
+    return `draw:${effectiveCity}:${JSON.stringify(geometryValidation.normalizedGeometry)}`
+  }, [effectiveCity, geometryValidation.isValid, geometryValidation.normalizedGeometry])
+
+  const selectedWardsAnalysisKey = useMemo(() => {
+    if (!effectiveCity || selectedWardIds.length <= 1 || !selectedWardGeometry) {
+      return ''
+    }
+    return `wards:${effectiveCity}:${selectedWardIds.slice().sort().join('|')}`
+  }, [effectiveCity, selectedWardGeometry, selectedWardIds])
+
+  useEffect(() => {
+    if (!drawnAnalysisKey || !geometryValidation.normalizedGeometry) {
+      return
+    }
+    if (lastSubmittedAnalysisKeyRef.current === drawnAnalysisKey) {
+      return
+    }
+    lastSubmittedAnalysisKeyRef.current = drawnAnalysisKey
+    submitAreaAnalysisMutation.mutate({
+      geometry: geometryValidation.normalizedGeometry,
+      source: 'drawn_polygon',
+      key: drawnAnalysisKey,
+      label: 'Drawn area of interest',
+    })
+  }, [drawnAnalysisKey, geometryValidation.normalizedGeometry, submitAreaAnalysisMutation])
+
+  useEffect(() => {
+    if (!selectedWardsAnalysisKey || !selectedWardGeometry || selectedWardIds.length <= 1) {
+      return
+    }
+    if (lastSubmittedAnalysisKeyRef.current === selectedWardsAnalysisKey) {
+      return
+    }
+    lastSubmittedAnalysisKeyRef.current = selectedWardsAnalysisKey
+    submitAreaAnalysisMutation.mutate({
+      geometry: selectedWardGeometry,
+      source: 'selected_wards',
+      key: selectedWardsAnalysisKey,
+      label: `${selectedWardIds.length} wards combined`,
+    })
+  }, [selectedWardGeometry, selectedWardIds.length, selectedWardsAnalysisKey, submitAreaAnalysisMutation])
+
+  useEffect(() => {
+    if (currentAoiSource !== 'selected_wards') {
+      clearAnalysisSource('selected_wards')
+    }
+    if (currentAoiSource !== 'drawn_polygon') {
+      clearAnalysisSource('drawn_polygon')
+    }
+  }, [clearAnalysisSource, currentAoiSource])
 
   const analyseJobQuery = useQuery({
     queryKey: ['analyse-job', activeJobId],
@@ -455,10 +629,218 @@ function App() {
     },
   })
 
-  const collectionCount = useMemo(() => {
-    const rows = parseWardRows(selectedCollectionQuery.data)
-    return rows.length
-  }, [selectedCollectionQuery.data])
+  const activeJob = analyseJobQuery.data
+
+  useEffect(() => {
+    if (activeJob?.status !== 'queued' && activeJob?.status !== 'running') {
+      return
+    }
+    const timer = window.setInterval(() => {
+      setJobClock(Date.now())
+    }, 1000)
+    return () => {
+      window.clearInterval(timer)
+    }
+  }, [activeJob?.status])
+
+  const activeJobElapsedSeconds = useMemo(() => {
+    if (!activeJob) {
+      return 0
+    }
+    const baseIso = activeJob.started_at ?? activeJob.created_at
+    if (!baseIso) {
+      return 0
+    }
+    const startMillis = new Date(baseIso).getTime()
+    if (!Number.isFinite(startMillis)) {
+      return 0
+    }
+    return Math.max(0, Math.floor((jobClock - startMillis) / 1000))
+  }, [activeJob, jobClock])
+
+  const activeJobProgressHint = useMemo(() => {
+    if (!activeJob) {
+      return ''
+    }
+    if (activeJob.status === 'queued') {
+      return 'Queued for AOI analysis.'
+    }
+    if (activeJob.status === 'running') {
+      if (activeJobElapsedSeconds < 20) {
+        return 'Normalizing geometry and loading metrics.'
+      }
+      if (activeJobElapsedSeconds < 90) {
+        return 'Computing AOI metrics. Medium and large areas take longer.'
+      }
+      return 'Still running. This AOI is relatively heavy.'
+    }
+    if (activeJob.status === 'failed') {
+      return 'AOI analysis failed.'
+    }
+    return 'AOI analysis complete.'
+  }, [activeJob, activeJobElapsedSeconds])
+
+  const roadLayerQuery = useQuery({
+    queryKey: ['city-roads-layer', effectiveCity, serializeViewportBbox(mapViewport), mapViewport?.zoom, showRoadOverlay],
+    queryFn: () =>
+      getCityRoadsGeoJSON(
+        effectiveCity,
+        serializeViewportBbox(mapViewport),
+        mapViewport?.zoom ?? 10,
+        (mapViewport?.zoom ?? 10) >= 12 ? 'full' : 'major',
+      ),
+    enabled: Boolean(effectiveCity && mapViewport && showRoadOverlay),
+    staleTime: 30_000,
+  })
+
+  const transitLayerQuery = useQuery({
+    queryKey: ['city-transit-layer', effectiveCity, serializeViewportBbox(mapViewport), showTransitOverlay],
+    queryFn: () => getCityTransitGeoJSON(effectiveCity, serializeViewportBbox(mapViewport)),
+    enabled: Boolean(effectiveCity && mapViewport && showTransitOverlay),
+    staleTime: 30_000,
+  })
+
+  const activeCustomPanelData = useMemo<PanelSnapshot | null>(() => {
+    if (!activeJob || activeJob.status !== 'succeeded' || !activeJob.result) {
+      return null
+    }
+
+    const metricsJson = activeJob.result.metrics_json as { all_metrics?: Record<string, unknown> } | undefined
+    if (!metricsJson?.all_metrics) {
+      return null
+    }
+
+    const sourceType = activeAnalysisSource === 'selected_wards' ? 'selected_wards' : 'drawn_polygon'
+    return {
+      sourceType,
+      sourceId: activeAnalysisKey || activeJob.job_id,
+      title: activeAnalysisLabel || 'Area of interest',
+      subtitle: sourceType === 'selected_wards' ? 'Multi-ward AOI analysed through the polygon engine.' : 'Custom drawn AOI analysed through the polygon engine.',
+      metrics: metricsJson.all_metrics,
+      qualitySummary: (activeJob.result.quality_summary as Record<string, unknown> | undefined) ?? {},
+    }
+  }, [activeAnalysisKey, activeAnalysisLabel, activeAnalysisSource, activeJob])
+
+  const wardPanelData = useMemo<PanelSnapshot | null>(() => {
+    if (!wardDetailsQuery.data?.metrics_json?.all_metrics || !effectiveSelectedWardId) {
+      return null
+    }
+
+    return {
+      sourceType: 'ward',
+      sourceId: effectiveSelectedWardId,
+      title: currentAoiDescription.title,
+      subtitle: currentAoiDescription.subtitle,
+      metrics: wardDetailsQuery.data.metrics_json.all_metrics as Record<string, unknown>,
+      qualitySummary: wardDetailsQuery.data.quality_summary,
+    }
+  }, [currentAoiDescription.subtitle, currentAoiDescription.title, effectiveSelectedWardId, wardDetailsQuery.data])
+
+  const activePanelData = useMemo<PanelSnapshot | null>(() => {
+    if (currentAoiSource === 'ward') {
+      return wardPanelData
+    }
+    if (currentAoiSource === 'selected_wards' && activeAnalysisSource === 'selected_wards') {
+      return activeCustomPanelData
+    }
+    if (currentAoiSource === 'drawn_polygon' && activeAnalysisSource === 'drawn_polygon') {
+      return activeCustomPanelData
+    }
+    return null
+  }, [activeAnalysisSource, activeCustomPanelData, currentAoiSource, wardPanelData])
+
+  const cityAverageMetricMap = useMemo(() => {
+    const map = new Map<string, number>()
+    for (const row of cityMetricsQuery.data?.metrics ?? []) {
+      map.set(row.metric_id, row.avg_value)
+    }
+    return map
+  }, [cityMetricsQuery.data])
+
+  const cityAveragePayload = useMemo<Record<string, unknown>>(
+    () => Object.fromEntries((cityMetricsQuery.data?.metrics ?? []).map((row) => [row.metric_id, row.avg_value])),
+    [cityMetricsQuery.data],
+  )
+
+  const narrativeContext = useMemo(() => {
+    if (currentAoiSource === 'city') {
+      return `${effectiveCity || 'the city'} overall`
+    }
+    return 'this area of interest'
+  }, [currentAoiSource, effectiveCity])
+
+  const highlightCards = useMemo(
+    () => buildHighlightCards(activePanelData?.metrics ?? cityAveragePayload, cityAverageMetricMap, metaMetricsQuery.data?.metrics ?? [], narrativeContext),
+    [activePanelData?.metrics, cityAverageMetricMap, cityAveragePayload, metaMetricsQuery.data?.metrics, narrativeContext],
+  )
+
+  const metricPanelRows = useMemo(
+    () => buildMetricPanelRows(activePanelData?.metrics ?? {}, metaMetricsQuery.data?.metrics ?? []),
+    [activePanelData?.metrics, metaMetricsQuery.data?.metrics],
+  )
+  const metricPanelGroups = useMemo(() => groupMetricPanelRows(metricPanelRows), [metricPanelRows])
+
+  const drawGuidance = useMemo(() => {
+    if (geometryValidation.errors.length > 0) {
+      return geometryValidation.errors[0]
+    }
+    if (drawMode === 'draw_polygon') {
+      return 'Click to add vertices. Double-click or finish the ring to submit immediately.'
+    }
+    if (drawMode === 'direct_select' && drawnGeometry) {
+      return 'Drag a vertex and release. The AOI refreshes automatically after the edit.'
+    }
+    if (drawnGeometry) {
+      return 'AOI is ready. Edit it or clear it. Results refresh automatically.'
+    }
+    if (selectedWardIds.length > 1) {
+      return 'Multiple wards are combined and analysed as one AOI automatically.'
+    }
+    if (selectedWardIds.length === 1) {
+      return 'Single ward selected. Click more wards to grow the AOI or draw a custom polygon.'
+    }
+    return 'Click wards to build an AOI or draw a custom polygon.'
+  }, [drawMode, drawnGeometry, geometryValidation.errors, selectedWardIds.length])
+
+  const handleExportJson = useCallback(() => {
+    if (!activePanelData || metricPanelRows.length === 0) {
+      setExportMessage('No AOI metric payload is ready yet.')
+      return
+    }
+
+    const fileName = `urbanmor_${effectiveCity}_${activePanelData.sourceType}_${activePanelData.sourceId}.json`
+    const payload = makeMetricsExportJson(
+      {
+        city: effectiveCity,
+        sourceType: activePanelData.sourceType === 'selected_wards' ? 'custom_polygon' : (activePanelData.sourceType as 'ward' | 'custom_polygon'),
+        sourceId: activePanelData.sourceId,
+        qualitySummary: activePanelData.qualitySummary,
+      },
+      metricPanelRows,
+    )
+    downloadTextFile(fileName, payload, 'application/json')
+    setExportMessage(`Exported ${fileName}`)
+  }, [activePanelData, effectiveCity, metricPanelRows])
+
+  const handleExportCsv = useCallback(() => {
+    if (!activePanelData || metricPanelRows.length === 0) {
+      setExportMessage('No AOI metric payload is ready yet.')
+      return
+    }
+
+    const fileName = `urbanmor_${effectiveCity}_${activePanelData.sourceType}_${activePanelData.sourceId}.csv`
+    const payload = makeMetricsExportCsv(
+      {
+        city: effectiveCity,
+        sourceType: activePanelData.sourceType === 'selected_wards' ? 'custom_polygon' : (activePanelData.sourceType as 'ward' | 'custom_polygon'),
+        sourceId: activePanelData.sourceId,
+        qualitySummary: activePanelData.qualitySummary,
+      },
+      metricPanelRows,
+    )
+    downloadTextFile(fileName, payload, 'text/csv;charset=utf-8')
+    setExportMessage(`Exported ${fileName}`)
+  }, [activePanelData, effectiveCity, metricPanelRows])
 
   useEffect(() => {
     if (!mapContainerRef.current || mapRef.current) {
@@ -467,7 +849,7 @@ function App() {
 
     const map = new maplibregl.Map({
       container: mapContainerRef.current,
-      style: BASEMAP_STYLE,
+      style: createBasemapStyle(),
       center: [78.9629, 20.5937],
       zoom: 4,
       attributionControl: {},
@@ -483,14 +865,43 @@ function App() {
 
     map.addControl(draw as unknown as maplibregl.IControl, 'top-left')
 
-    const ensureWardLayers = () => {
+    const ensureLayers = () => {
+      if (!map.getSource('roads-overlay-source')) {
+        map.addSource('roads-overlay-source', {
+          type: 'geojson',
+          data: emptyFeatureCollection(),
+        })
+      }
+
+      if (!map.getLayer('roads-overlay-line')) {
+        map.addLayer({
+          id: 'roads-overlay-line',
+          type: 'line',
+          source: 'roads-overlay-source',
+          paint: {
+            'line-color': '#ea580c',
+            'line-opacity': 0.45,
+            'line-width': [
+              'interpolate',
+              ['linear'],
+              ['coalesce', ['to-number', ['get', 'style_rank']], 1],
+              1,
+              0.7,
+              2,
+              1.2,
+              3,
+              1.8,
+              4,
+              2.6,
+            ],
+          },
+        })
+      }
+
       if (!map.getSource('wards-source')) {
         map.addSource('wards-source', {
           type: 'geojson',
-          data: {
-            type: 'FeatureCollection',
-            features: [],
-          },
+          data: emptyFeatureCollection(),
           promoteId: 'ward_id',
         })
       }
@@ -501,8 +912,8 @@ function App() {
           type: 'fill',
           source: 'wards-source',
           paint: {
-            'fill-color': '#cbd5e1',
-            'fill-opacity': 0.75,
+            'fill-color': '#d6d3d1',
+            'fill-opacity': 0.22,
           },
         })
       }
@@ -514,8 +925,8 @@ function App() {
           source: 'wards-source',
           paint: {
             'line-color': '#334155',
-            'line-width': 0.7,
-            'line-opacity': 0.5,
+            'line-width': 0.9,
+            'line-opacity': 0.45,
           },
         })
       }
@@ -526,7 +937,7 @@ function App() {
           type: 'line',
           source: 'wards-source',
           paint: {
-            'line-color': '#111827',
+            'line-color': '#0f172a',
             'line-width': 2,
           },
           filter: ['==', ['get', 'ward_id'], ''],
@@ -539,36 +950,101 @@ function App() {
           type: 'line',
           source: 'wards-source',
           paint: {
-            'line-color': '#ef4444',
-            'line-width': 2.2,
+            'line-color': '#0f766e',
+            'line-width': 2.8,
           },
           filter: ['in', ['get', 'ward_id'], ['literal', []]],
         })
       }
+
+      if (!map.getSource('transit-overlay-source')) {
+        map.addSource('transit-overlay-source', {
+          type: 'geojson',
+          data: emptyFeatureCollection(),
+        })
+      }
+
+      if (!map.getLayer('transit-overlay-circle')) {
+        map.addLayer({
+          id: 'transit-overlay-circle',
+          type: 'circle',
+          source: 'transit-overlay-source',
+          paint: {
+            'circle-radius': [
+              'match',
+              ['get', 'stop_kind'],
+              'metro',
+              5.5,
+              'rail',
+              4.8,
+              'station',
+              4.2,
+              3.2,
+            ],
+            'circle-color': [
+              'match',
+              ['get', 'stop_kind'],
+              'metro',
+              '#dc2626',
+              'rail',
+              '#7c3aed',
+              'station',
+              '#0f766e',
+              '#1d4ed8',
+            ],
+            'circle-stroke-color': '#fffbeb',
+            'circle-stroke-width': 1.2,
+            'circle-opacity': 0.9,
+          },
+        })
+      }
+    }
+
+    const updateViewport = () => {
+      const bounds = map.getBounds()
+      setMapViewport({
+        west: bounds.getWest(),
+        south: bounds.getSouth(),
+        east: bounds.getEast(),
+        north: bounds.getNorth(),
+        zoom: map.getZoom(),
+      })
     }
 
     const onWardClick = (event: MapMouseEvent & { features?: MapGeoJSONFeature[] }) => {
+      if (isDrawInteractionMode(draw.getMode())) {
+        return
+      }
       const feature = event.features?.[0]
       const wardId = feature?.properties?.ward_id
       if (typeof wardId !== 'string') {
         return
       }
 
-      setSelectedWardId(wardId)
-      setActiveMetricPanelSource('ward')
+      if (
+        draw
+          .getAll()
+          .features.some((item) => item.geometry.type === 'Polygon' || item.geometry.type === 'MultiPolygon')
+      ) {
+        draw.deleteAll()
+        setDrawnGeometry(null)
+        setDrawnFeatureId('')
+        setDrawMode('simple_select')
+        setActiveJobId('')
+        setActiveAnalysisSource(null)
+        setActiveAnalysisLabel('')
+        setActiveAnalysisKey('')
+      }
+
+      setSelectedWardIds((current) => (current.includes(wardId) ? current.filter((item) => item !== wardId) : [...current, wardId]))
       setExportMessage('')
-      setSelectedWardIds((current) => {
-        if (event.originalEvent.shiftKey || event.originalEvent.metaKey || event.originalEvent.ctrlKey) {
-          if (current.includes(wardId)) {
-            return current.filter((item) => item !== wardId)
-          }
-          return [...current, wardId]
-        }
-        return [wardId]
-      })
     }
 
     const onWardHover = (event: MapMouseEvent & { features?: MapGeoJSONFeature[] }) => {
+      if (isDrawInteractionMode(draw.getMode())) {
+        setHoverWardId('')
+        return
+      }
       const feature = event.features?.[0]
       const wardId = feature?.properties?.ward_id
       if (typeof wardId === 'string') {
@@ -582,16 +1058,35 @@ function App() {
       setHoverWardId('')
     }
 
+    const onDrawCreate = () => {
+      syncDrawnState()
+      draw.changeMode('simple_select')
+      setDrawMode('simple_select')
+      setExportMessage('')
+    }
+
+    const onDrawUpdate = () => {
+      syncDrawnState()
+      setExportMessage('')
+    }
+
+    const onDrawDelete = () => {
+      syncDrawnState()
+      setExportMessage('')
+    }
+
     map.on('load', () => {
-      ensureWardLayers()
+      ensureLayers()
       map.on('click', 'wards-fill', onWardClick)
       map.on('mousemove', 'wards-fill', onWardHover)
       map.on('mouseleave', 'wards-fill', onWardLeave)
+      updateViewport()
     })
 
-    map.on('draw.create', syncDrawnState)
-    map.on('draw.update', syncDrawnState)
-    map.on('draw.delete', syncDrawnState)
+    map.on('moveend', updateViewport)
+    map.on('draw.create', onDrawCreate)
+    map.on('draw.update', onDrawUpdate)
+    map.on('draw.delete', onDrawDelete)
     map.on('draw.modechange', (event: { mode?: string }) => {
       if (typeof event.mode === 'string' && event.mode) {
         setDrawMode(event.mode)
@@ -610,7 +1105,7 @@ function App() {
 
   useEffect(() => {
     const map = mapRef.current
-    if (!map || !map.isStyleLoaded()) {
+    if (!map) {
       return
     }
 
@@ -620,7 +1115,6 @@ function App() {
     }
 
     source.setData(geojsonData)
-
     if (map.getLayer('wards-fill')) {
       map.setPaintProperty('wards-fill', 'fill-color', buildFillExpression(metricRange.min, metricRange.max) as never)
     }
@@ -631,7 +1125,6 @@ function App() {
     if (!map || !map.getLayer('wards-hover')) {
       return
     }
-
     map.setFilter('wards-hover', ['==', ['get', 'ward_id'], hoverWardId || ''])
   }, [hoverWardId])
 
@@ -640,572 +1133,394 @@ function App() {
     if (!map || !map.getLayer('wards-selected')) {
       return
     }
-
     map.setFilter('wards-selected', ['in', ['get', 'ward_id'], ['literal', selectedWardIds]])
   }, [selectedWardIds])
 
   useEffect(() => {
-    if (!effectiveCity) {
-      return
-    }
-
     const map = mapRef.current
     if (!map) {
       return
     }
 
-    const bounds = computeBounds(geojsonData)
-    if (!bounds) {
+    if (map.getLayer('basemap-street')) {
+      map.setLayoutProperty('basemap-street', 'visibility', basemapMode === 'street' ? 'visible' : 'none')
+    }
+    if (map.getLayer('basemap-satellite')) {
+      map.setLayoutProperty('basemap-satellite', 'visibility', basemapMode === 'satellite' ? 'visible' : 'none')
+    }
+    if (map.getLayer('roads-overlay-line')) {
+      map.setPaintProperty('roads-overlay-line', 'line-color', basemapMode === 'satellite' ? '#fef3c7' : '#ea580c')
+      map.setPaintProperty('roads-overlay-line', 'line-opacity', basemapMode === 'satellite' ? 0.72 : 0.42)
+    }
+  }, [basemapMode])
+
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) {
+      return
+    }
+    const source = map.getSource('roads-overlay-source') as maplibregl.GeoJSONSource | undefined
+    if (!source) {
+      return
+    }
+    source.setData(showRoadOverlay ? (roadLayerQuery.data as CityMapLayerGeoJSONResponse | undefined) ?? emptyFeatureCollection() : emptyFeatureCollection())
+  }, [roadLayerQuery.data, showRoadOverlay])
+
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) {
+      return
+    }
+    const source = map.getSource('transit-overlay-source') as maplibregl.GeoJSONSource | undefined
+    if (!source) {
+      return
+    }
+    source.setData(showTransitOverlay ? (transitLayerQuery.data as CityMapLayerGeoJSONResponse | undefined) ?? emptyFeatureCollection() : emptyFeatureCollection())
+  }, [showTransitOverlay, transitLayerQuery.data])
+
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || !map.getLayer('wards-fill')) {
       return
     }
 
+    const isLocked = isDrawInteractionMode(drawMode)
+    map.setPaintProperty('wards-fill', 'fill-opacity', isLocked ? 0.12 : 0.22)
+    map.getCanvas().style.cursor = isLocked ? 'crosshair' : ''
+  }, [drawMode])
+
+  useEffect(() => {
+    if (!effectiveCity) {
+      return
+    }
+    const map = mapRef.current
+    if (!map || !wardsGeoQuery.data) {
+      return
+    }
+    const bounds = computeBounds({ type: 'FeatureCollection', features: wardsGeoQuery.data.features })
+    if (!bounds) {
+      return
+    }
     map.fitBounds(bounds, {
       padding: 40,
       duration: 700,
     })
-  }, [effectiveCity, geojsonData])
+  }, [effectiveCity, wardsGeoQuery.data])
 
   const cityError = citiesQuery.error instanceof Error ? citiesQuery.error.message : ''
   const wardError = wardsQuery.error instanceof Error ? wardsQuery.error.message : ''
   const metricError = cityWardsMetricsQuery.error instanceof Error ? cityWardsMetricsQuery.error.message : ''
   const cityAverageError = cityMetricsQuery.error instanceof Error ? cityMetricsQuery.error.message : ''
-  const referenceWardError = referenceWardMetricsQuery.error instanceof Error ? referenceWardMetricsQuery.error.message : ''
-
-  const activeJob = analyseJobQuery.data
-  const customPolygonPanelData = useMemo<PanelSnapshot | null>(() => {
-    if (activeJob?.status !== 'succeeded' || !activeJob.result) {
-      return null
-    }
-
-    const metricsJson = activeJob.result.metrics_json as { all_metrics?: Record<string, unknown> } | undefined
-    if (!metricsJson?.all_metrics) {
-      return null
-    }
-
-    return {
-      sourceType: 'custom_polygon' as const,
-      sourceId: activeJob.job_id,
-      metrics: metricsJson.all_metrics,
-      qualitySummary: (activeJob.result.quality_summary as Record<string, unknown> | undefined) ?? {},
-    }
-  }, [activeJob])
-
-  const wardPanelData = useMemo<PanelSnapshot | null>(() => {
-    if (!wardDetailsQuery.data?.metrics_json?.all_metrics) {
-      return null
-    }
-    return {
-      sourceType: 'ward' as const,
-      sourceId: wardDetailsQuery.data.ward_id,
-      metrics: wardDetailsQuery.data.metrics_json.all_metrics as Record<string, unknown>,
-      qualitySummary: wardDetailsQuery.data.quality_summary,
-    }
-  }, [wardDetailsQuery.data])
-
-  const activePanelData = useMemo(() => {
-    if (activeMetricPanelSource === 'custom_polygon' && customPolygonPanelData) {
-      return customPolygonPanelData
-    }
-    if (activeMetricPanelSource === 'ward' && wardPanelData) {
-      return wardPanelData
-    }
-    return customPolygonPanelData ?? wardPanelData
-  }, [activeMetricPanelSource, customPolygonPanelData, wardPanelData])
-
-  const metricPanelRows = useMemo(
-    () => buildMetricPanelRows(activePanelData?.metrics ?? {}, metaMetricsQuery.data?.metrics ?? []),
-    [activePanelData, metaMetricsQuery.data?.metrics],
-  )
-  const metricPanelGroups = useMemo(() => groupMetricPanelRows(metricPanelRows), [metricPanelRows])
-  const cityAverageMetricMap = useMemo(() => {
-    const map = new Map<string, number>()
-    for (const row of cityMetricsQuery.data?.metrics ?? []) {
-      map.set(row.metric_id, row.avg_value)
-    }
-    return map
-  }, [cityMetricsQuery.data])
-  const referenceWardRows = useMemo(
-    () => buildMetricPanelRows(referenceWardMetricsQuery.data?.metrics_json?.all_metrics ?? {}, metaMetricsQuery.data?.metrics ?? []),
-    [referenceWardMetricsQuery.data, metaMetricsQuery.data?.metrics],
-  )
-  const referenceWardMetricMap = useMemo(() => numericMetricMapFromRows(referenceWardRows), [referenceWardRows])
-  const activeReferenceMap = useMemo(
-    () => (referenceMode === 'city_average' ? cityAverageMetricMap : referenceWardMetricMap),
-    [referenceMode, cityAverageMetricMap, referenceWardMetricMap],
-  )
-  const deltaRows = useMemo(
-    () => buildDeltaRows(metricPanelRows, activeReferenceMap),
-    [metricPanelRows, activeReferenceMap],
-  )
-  const referenceLabel =
-    referenceMode === 'city_average'
-      ? `City Average (${effectiveCity})`
-      : `Ward ${effectiveReferenceWardId || 'N/A'}`
-
-  const makeCompareSnapshot = useCallback((): CompareSnapshot | null => {
-    if (!activePanelData || metricPanelRows.length === 0) {
-      return null
-    }
-
-    const title =
-      activePanelData.sourceType === 'ward'
-        ? `Ward ${activePanelData.sourceId}`
-        : `Polygon ${activePanelData.sourceId.slice(0, 8)}`
-    return {
-      sourceType: activePanelData.sourceType,
-      sourceId: activePanelData.sourceId,
-      metrics: activePanelData.metrics,
-      qualitySummary: activePanelData.qualitySummary,
-      title,
-    }
-  }, [activePanelData, metricPanelRows.length])
-
-  const compareLeftRows = useMemo(
-    () => buildMetricPanelRows(compareLeft?.metrics ?? {}, metaMetricsQuery.data?.metrics ?? []),
-    [compareLeft?.metrics, metaMetricsQuery.data?.metrics],
-  )
-  const compareRightRows = useMemo(
-    () => buildMetricPanelRows(compareRight?.metrics ?? {}, metaMetricsQuery.data?.metrics ?? []),
-    [compareRight?.metrics, metaMetricsQuery.data?.metrics],
-  )
-  const sideBySideRows = useMemo(
-    () => buildSideBySideRows(compareLeftRows, compareRightRows),
-    [compareLeftRows, compareRightRows],
-  )
-
-  const drawGuidance = useMemo(() => {
-    if (geometryValidation.errors.length > 0) {
-      return geometryValidation.errors[0]
-    }
-    if (drawMode === 'draw_polygon') {
-      return 'Click to add vertices. Double-click or click the first vertex to finish. Use Complete to exit draw mode.'
-    }
-    if (drawMode === 'direct_select' && drawnGeometry) {
-      return 'Drag existing vertices to edit the polygon. Use Complete when edits are done.'
-    }
-    if (drawnGeometry) {
-      return 'Polygon is ready. Use Edit to refine it or Clear to remove it.'
-    }
-    return 'Press Draw to start creating a polygon.'
-  }, [drawMode, drawnGeometry, geometryValidation.errors])
-
-  const handleExportJson = useCallback(() => {
-    if (!activePanelData || metricPanelRows.length === 0) {
-      setExportMessage('No metric payload available to export yet.')
-      return
-    }
-
-    const fileName = `urbanmor_${effectiveCity}_${activePanelData.sourceType}_${activePanelData.sourceId}.json`
-    const payload = makeMetricsExportJson(
-      {
-        city: effectiveCity,
-        sourceType: activePanelData.sourceType,
-        sourceId: activePanelData.sourceId,
-        qualitySummary: activePanelData.qualitySummary,
-      },
-      metricPanelRows,
-    )
-    downloadTextFile(fileName, payload, 'application/json')
-    setExportMessage(`Exported ${fileName}`)
-  }, [activePanelData, effectiveCity, metricPanelRows])
-
-  const handleExportCsv = useCallback(() => {
-    if (!activePanelData || metricPanelRows.length === 0) {
-      setExportMessage('No metric payload available to export yet.')
-      return
-    }
-
-    const fileName = `urbanmor_${effectiveCity}_${activePanelData.sourceType}_${activePanelData.sourceId}.csv`
-    const payload = makeMetricsExportCsv(
-      {
-        city: effectiveCity,
-        sourceType: activePanelData.sourceType,
-        sourceId: activePanelData.sourceId,
-        qualitySummary: activePanelData.qualitySummary,
-      },
-      metricPanelRows,
-    )
-    downloadTextFile(fileName, payload, 'text/csv;charset=utf-8')
-    setExportMessage(`Exported ${fileName}`)
-  }, [activePanelData, effectiveCity, metricPanelRows])
-
-  const handleSetCompareLeft = useCallback(() => {
-    const snapshot = makeCompareSnapshot()
-    if (!snapshot) {
-      setExportMessage('Load a metric result first, then set compare slots.')
-      return
-    }
-    setCompareLeft(snapshot)
-    setExportMessage(`Set Left: ${snapshot.title}`)
-  }, [makeCompareSnapshot])
-
-  const handleSetCompareRight = useCallback(() => {
-    const snapshot = makeCompareSnapshot()
-    if (!snapshot) {
-      setExportMessage('Load a metric result first, then set compare slots.')
-      return
-    }
-    setCompareRight(snapshot)
-    setExportMessage(`Set Right: ${snapshot.title}`)
-  }, [makeCompareSnapshot])
+  const fullMetricError = wardDetailsQuery.error instanceof Error ? wardDetailsQuery.error.message : ''
+  const roadLayerError = roadLayerQuery.error instanceof Error ? roadLayerQuery.error.message : ''
+  const transitLayerError = transitLayerQuery.error instanceof Error ? transitLayerQuery.error.message : ''
 
   return (
-    <div className="h-screen w-screen bg-slate-100 text-slate-900">
-      <div className="grid h-full grid-cols-12">
-        <aside className="col-span-12 border-b border-slate-300 bg-white p-4 shadow-sm md:col-span-4 md:border-b-0 md:border-r lg:col-span-3">
-          <h1 className="text-lg font-semibold tracking-tight">UrbanMor Analytics</h1>
-          <p className="mt-1 text-xs text-slate-500">City/ward metrics, choropleths, and custom polygon analysis</p>
-
-          <div className="mt-4 space-y-3">
-            <div>
-              <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-slate-500">City</label>
-              <select
-                className="w-full rounded border border-slate-300 bg-white px-2 py-2 text-sm"
-                value={effectiveCity}
-                disabled={!citiesQuery.data?.cities?.length}
-                onChange={(event) => {
-                  const nextCity = event.target.value
-                  setSelectedCity(nextCity)
-                  setSelectedWardId('')
-                  setSelectedWardIds([])
-                  setHoverWardId('')
-                  setActiveJobId('')
-                  setActiveMetricPanelSource('ward')
-                  setReferenceWardId('')
-                  setCompareLeft(null)
-                  setCompareRight(null)
-                  setExportMessage('')
-                  clearDrawnGeometry()
-                }}
-              >
-                {citiesQuery.data?.cities.map((city) => (
-                  <option key={city.city} value={city.city}>
-                    {city.city} ({city.cached_wards}/{city.expected_wards})
-                  </option>
-                ))}
-              </select>
-              {!citiesQuery.data?.cities?.length ? (
-                <p className="mt-1 text-[11px] text-rose-700">No ready cities found. Check cache/data ingestion state.</p>
-              ) : null}
-            </div>
-
-            <div>
-              <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-slate-500">Choropleth Metric</label>
-              <select
-                className="w-full rounded border border-slate-300 bg-white px-2 py-2 text-sm"
-                value={effectiveMetricId}
-                onChange={(event) => setActiveMetricId(event.target.value)}
-              >
-                {metaMetricsQuery.data?.metrics.map((metric) => (
-                  <option key={metric.metric_id} value={metric.metric_id}>
-                    {metric.metric_id}
-                  </option>
-                ))}
-              </select>
-              <p className="mt-1 text-[11px] text-slate-500">
-                Range: {metricRange.min === null ? 'n/a' : metricRange.min.toFixed(3)} to{' '}
-                {metricRange.max === null ? 'n/a' : metricRange.max.toFixed(3)}
-              </p>
-            </div>
-
-            <div className="rounded border border-slate-200 bg-slate-50 p-2 text-xs">
-              <p>Wards loaded: {wardsQuery.data?.total_wards ?? 0}</p>
-              <p>Selected wards: {selectedWardIds.length}</p>
-              <p>Hovered ward: {hoverWardId || 'None'}</p>
-              <p>Metric rows ready: {wardRows.length}</p>
-            </div>
-
-            <div className="rounded border border-slate-200 bg-slate-50 p-2 text-xs">
-              <p className="font-semibold uppercase tracking-wide text-slate-600">Draw Toolbar</p>
-              <div className="mt-2 grid grid-cols-2 gap-2">
-                <button
-                  type="button"
-                  className="rounded border border-slate-400 bg-white px-2 py-2 text-xs"
-                  onClick={activateDrawMode}
-                >
-                  Draw
-                </button>
-                <button
-                  type="button"
-                  className="rounded border border-slate-400 bg-white px-2 py-2 text-xs disabled:cursor-not-allowed disabled:opacity-50"
-                  disabled={!drawnGeometry && drawMode !== 'draw_polygon'}
-                  onClick={completeDrawMode}
-                >
-                  Complete
-                </button>
-                <button
-                  type="button"
-                  className="rounded border border-slate-400 bg-white px-2 py-2 text-xs disabled:cursor-not-allowed disabled:opacity-50"
-                  disabled={!drawnGeometry}
-                  onClick={activateEditMode}
-                >
-                  Edit
-                </button>
-                <button
-                  type="button"
-                  className="rounded border border-slate-400 bg-white px-2 py-2 text-xs disabled:cursor-not-allowed disabled:opacity-50"
-                  disabled={!drawnGeometry}
-                  onClick={clearDrawnGeometry}
-                >
-                  Clear
-                </button>
-              </div>
-              <p className="mt-2 text-[11px] text-slate-600">{drawGuidance}</p>
-              <p className="mt-1 text-[11px] text-slate-500">Current mode: {drawMode}</p>
-              <p className="mt-1 text-[11px] text-slate-500">
-                Geometry: {geometryValidation.vertexCount} vertices
-                {geometryValidation.areaSqM ? `, ${geometryValidation.areaSqM.toFixed(1)} m2` : ''}
-              </p>
-              {geometryValidation.errors.length > 0 ? (
-                <div className="mt-2 rounded border border-red-200 bg-red-50 p-2 text-[11px] text-red-700">
-                  {geometryValidation.errors.map((message) => (
-                    <p key={message}>{message}</p>
-                  ))}
-                </div>
-              ) : null}
-              {geometryValidation.warnings.length > 0 ? (
-                <div className="mt-2 rounded border border-amber-200 bg-amber-50 p-2 text-[11px] text-amber-800">
-                  {geometryValidation.warnings.map((message) => (
-                    <p key={message}>{message}</p>
-                  ))}
-                </div>
-              ) : null}
-            </div>
-
-            <div className="flex gap-2">
-              <button
-                type="button"
-                className="rounded bg-slate-800 px-3 py-2 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:bg-slate-400"
-                disabled={!geometryValidation.isValid || enqueueCustomPolygonMutation.isPending || !effectiveCity}
-                onClick={() => enqueueCustomPolygonMutation.mutate()}
-              >
-                Analyse Drawn Polygon
-              </button>
-              <button
-                type="button"
-                className="rounded border border-slate-400 px-3 py-2 text-xs"
-                onClick={() => {
-                  setSelectedWardId('')
-                  setSelectedWardIds([])
-                  setActiveMetricPanelSource('ward')
-                  setExportMessage('')
-                }}
-              >
-                Clear Selection
-              </button>
-            </div>
+    <div className="urbanmor-shell h-screen w-screen text-slate-900">
+      <div className="grid h-full grid-cols-12 gap-3 p-3">
+        <aside className="urbanmor-sidebar col-span-12 overflow-y-auto rounded-[28px] p-4 md:col-span-4 lg:col-span-3">
+          <div className="urbanmor-masthead rounded-[24px] p-4 text-white">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-amber-100">UrbanMorph</p>
+            <h1 className="mt-2 text-4xl leading-none">Area-first urban diagnostics</h1>
+            <p className="mt-3 max-w-xs text-sm text-slate-100/90">
+              Pick a city, click wards to build an area of interest, or draw a polygon. Results update automatically.
+            </p>
           </div>
 
-          <section className="mt-4 space-y-2 text-xs">
-            <h2 className="font-semibold uppercase tracking-wide text-slate-600">Custom Polygon Job</h2>
-            {!activeJobId ? <p className="text-slate-500">Draw a polygon and start analysis.</p> : null}
-            {enqueueCustomPolygonMutation.isError && enqueueCustomPolygonMutation.error instanceof Error ? (
-              <p className="rounded border border-red-200 bg-red-50 p-2 text-red-700">{enqueueCustomPolygonMutation.error.message}</p>
+          <section className="mt-4 rounded-[24px] border border-stone-200 bg-white/95 p-4 shadow-sm">
+            <label className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">City</label>
+            <select
+              className="mt-2 w-full rounded-2xl border border-stone-300 bg-white px-3 py-3 text-sm outline-none transition focus:border-cyan-600 focus:ring-2 focus:ring-cyan-100"
+              value={effectiveCity}
+              disabled={!citiesQuery.data?.cities?.length}
+              onChange={(event) => {
+                setSelectedCity(event.target.value)
+                clearAllAoi()
+              }}
+            >
+              {citiesQuery.data?.cities.map((city) => (
+                <option key={city.city} value={city.city}>
+                  {city.city} ({city.cached_wards}/{city.expected_wards})
+                </option>
+              ))}
+            </select>
+            <p className="mt-2 text-[11px] text-slate-500">
+              Start with one ward, add more wards, or switch to a fully custom polygon.
+            </p>
+          </section>
+
+          <section className="mt-4 rounded-[24px] border border-stone-200 bg-white/95 p-4 shadow-sm">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Area Of Interest</p>
+                <h2 className="mt-2 text-2xl text-slate-900">{currentAoiDescription.title}</h2>
+                <p className="mt-1 text-sm text-slate-600">{currentAoiDescription.subtitle}</p>
+              </div>
+              <span className="rounded-full border border-stone-200 bg-stone-50 px-3 py-1 text-[11px] font-medium text-slate-600">
+                {currentAoiDescription.areaLabel}
+              </span>
+            </div>
+
+            <div className="mt-4 grid grid-cols-2 gap-2 text-[11px] text-slate-600">
+              <div className="rounded-2xl border border-stone-200 bg-stone-50 px-3 py-2">
+                <p className="font-semibold uppercase tracking-[0.16em] text-slate-500">Wards In AOI</p>
+                <p className="mt-1 text-lg font-semibold text-slate-900">{selectedWardIds.length}</p>
+              </div>
+              <div className="rounded-2xl border border-stone-200 bg-stone-50 px-3 py-2">
+                <p className="font-semibold uppercase tracking-[0.16em] text-slate-500">Mode</p>
+                <p className="mt-1 text-lg font-semibold text-slate-900">{currentAoiSource.replace('_', ' ')}</p>
+              </div>
+            </div>
+
+            <div className="mt-4 flex flex-wrap gap-2">
+              <button type="button" className="rounded-full bg-slate-950 px-4 py-2 text-xs font-semibold text-white transition hover:bg-slate-800" onClick={activateDrawMode}>
+                Draw AOI
+              </button>
+              <button
+                type="button"
+                className="rounded-full border border-stone-300 bg-white px-4 py-2 text-xs font-semibold text-slate-700 transition hover:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={!drawnGeometry}
+                onClick={activateEditMode}
+              >
+                Edit Shape
+              </button>
+              <button type="button" className="rounded-full border border-stone-300 bg-white px-4 py-2 text-xs font-semibold text-slate-700 transition hover:bg-stone-50" onClick={clearAllAoi}>
+                Reset AOI
+              </button>
+            </div>
+
+            <p className="mt-3 rounded-2xl border border-cyan-100 bg-cyan-50 px-3 py-2 text-sm text-cyan-900">{drawGuidance}</p>
+
+            {geometryValidation.errors.length > 0 ? (
+              <div className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 p-3 text-[11px] text-rose-700">
+                {geometryValidation.errors.map((message) => (
+                  <p key={message}>{message}</p>
+                ))}
+              </div>
             ) : null}
-            {activeJob ? (
-              <div className="rounded border border-slate-200 bg-white p-2">
-                <p>Job: {activeJob.job_id.slice(0, 8)}...</p>
-                <p>Status: {activeJob.status}</p>
-                <p>
-                  Progress: {activeJob.progress_pct}%{activeJob.progress_message ? ` (${activeJob.progress_message})` : ''}
+
+            {geometryValidation.warnings.length > 0 ? (
+              <div className="mt-3 rounded-2xl border border-amber-200 bg-amber-50 p-3 text-[11px] text-amber-800">
+                {geometryValidation.warnings.map((message) => (
+                  <p key={message}>{message}</p>
+                ))}
+              </div>
+            ) : null}
+
+            {submitAreaAnalysisMutation.isError && submitAreaAnalysisMutation.error instanceof Error ? (
+              <div className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 p-3 text-[11px] text-rose-700">
+                {submitAreaAnalysisMutation.error.message}
+              </div>
+            ) : null}
+
+            {activeJobId ? (
+              <div className="mt-4 rounded-[22px] border border-stone-200 bg-stone-50 p-3 text-sm text-slate-700">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="font-semibold text-slate-900">Analysing: {activeAnalysisLabel || 'AOI'}</p>
+                  <span className="rounded-full border border-stone-200 bg-white px-2 py-1 text-[11px] uppercase tracking-[0.16em] text-slate-500">
+                    {activeJob?.status ?? 'queued'}
+                  </span>
+                </div>
+                <div className="mt-3 h-2 overflow-hidden rounded-full bg-stone-200">
+                  <div className="h-full rounded-full bg-cyan-600 transition-all duration-500" style={{ width: `${activeJob?.progress_pct ?? 10}%` }} />
+                </div>
+                <p className="mt-2 text-[11px] text-slate-500">
+                  {formatElapsed(activeJobElapsedSeconds)} · {activeJobProgressHint}
                 </p>
-                {activeJob.error ? <p className="text-red-600">{activeJob.error}</p> : null}
+                {activeJob?.error ? <p className="mt-2 text-[11px] text-rose-700">{activeJob.error}</p> : null}
               </div>
             ) : null}
           </section>
 
-          <section className="mt-4 space-y-2 text-xs">
-            <h2 className="font-semibold uppercase tracking-wide text-slate-600">Metric Panel</h2>
+          <section className="mt-4 rounded-[24px] border border-stone-200 bg-white/95 p-4 shadow-sm">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Key Insights</p>
+                <h2 className="mt-1 text-xl text-slate-900">Four non-overlapping reads</h2>
+              </div>
+              <span className="rounded-full border border-stone-200 bg-stone-50 px-3 py-1 text-[11px] text-slate-500">
+                {currentAoiSource === 'city' ? 'City baseline' : 'AOI result'}
+              </span>
+            </div>
+            <div className="mt-4 space-y-3">
+              {highlightCards.map((card) => (
+                <article key={card.metricId} className="rounded-[22px] border border-stone-200 bg-stone-50 p-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">{card.theme}</p>
+                      <h3 className="mt-1 text-base font-semibold text-slate-900">{card.label}</h3>
+                    </div>
+                    <span className="rounded-full border border-stone-200 bg-white px-3 py-1 text-[11px] font-medium text-slate-600">
+                      {card.comparison}
+                    </span>
+                  </div>
+                  <p className="mt-3 text-3xl font-semibold text-slate-950">
+                    {card.value === null ? 'N/A' : formatMetricNumber(card.value)}
+                    <span className="ml-2 text-xs font-medium uppercase tracking-[0.14em] text-slate-500">{card.unit}</span>
+                  </p>
+                  <p className="mt-3 text-sm leading-6 text-slate-600">{card.narrative}</p>
+                </article>
+              ))}
+            </div>
+          </section>
+
+          <details className="mt-4 rounded-[24px] border border-stone-200 bg-white/95 p-4 shadow-sm">
+            <summary className="cursor-pointer list-none text-sm font-semibold text-slate-900">
+              Drill Down: full metrics and downloads
+            </summary>
+            <p className="mt-2 text-[11px] text-slate-500">
+              Keep the first screen lightweight. Open this only when you need the full metric stack or exports.
+            </p>
+
             {!activePanelData ? (
-              <p className="text-slate-500">Click a ward or run custom polygon analysis to load metric details.</p>
+              <p className="mt-4 rounded-2xl border border-stone-200 bg-stone-50 p-3 text-sm text-slate-600">
+                Select wards or draw a polygon to unlock exhaustive AOI metrics and downloads.
+              </p>
             ) : (
               <>
-                <div className="rounded border border-slate-200 bg-white p-2 text-[11px]">
-                  <p>
-                    Source: {activePanelData.sourceType} ({activePanelData.sourceId})
-                  </p>
-                  <p>Metrics available: {metricPanelRows.length}</p>
-                  {typeof activePanelData.qualitySummary?.completeness_ratio === 'number' ? (
-                    <p>Completeness: {(Number(activePanelData.qualitySummary.completeness_ratio) * 100).toFixed(1)}%</p>
-                  ) : null}
+                <div className="mt-4 rounded-[22px] border border-stone-200 bg-stone-50 p-3 text-sm text-slate-700">
+                  <p className="font-semibold text-slate-900">{activePanelData.title}</p>
+                  <p className="mt-1 text-slate-600">{activePanelData.subtitle}</p>
+                  <p className="mt-2 text-[11px] text-slate-500">{metricPanelRows.length} metrics available</p>
                 </div>
 
-                <div className="flex flex-wrap gap-2">
-                  <button
-                    type="button"
-                    className="rounded border border-slate-400 bg-white px-2 py-1 text-[11px]"
-                    onClick={handleExportJson}
-                    disabled={metricPanelRows.length === 0}
-                  >
-                    Export JSON
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <button type="button" className="rounded-full bg-slate-950 px-4 py-2 text-xs font-semibold text-white transition hover:bg-slate-800" onClick={handleExportJson}>
+                    Download JSON
                   </button>
-                  <button
-                    type="button"
-                    className="rounded border border-slate-400 bg-white px-2 py-1 text-[11px]"
-                    onClick={handleExportCsv}
-                    disabled={metricPanelRows.length === 0}
-                  >
-                    Export CSV
-                  </button>
-                  <button
-                    type="button"
-                    className="rounded border border-slate-400 bg-white px-2 py-1 text-[11px]"
-                    onClick={handleSetCompareLeft}
-                    disabled={metricPanelRows.length === 0}
-                  >
-                    Set As Left
-                  </button>
-                  <button
-                    type="button"
-                    className="rounded border border-slate-400 bg-white px-2 py-1 text-[11px]"
-                    onClick={handleSetCompareRight}
-                    disabled={metricPanelRows.length === 0}
-                  >
-                    Set As Right
+                  <button type="button" className="rounded-full border border-stone-300 bg-white px-4 py-2 text-xs font-semibold text-slate-700 transition hover:bg-stone-50" onClick={handleExportCsv}>
+                    Download CSV
                   </button>
                 </div>
-                {exportMessage ? <p className="text-[11px] text-slate-600">{exportMessage}</p> : null}
+                {exportMessage ? <p className="mt-2 text-[11px] text-slate-500">{exportMessage}</p> : null}
 
-                <div className="rounded border border-slate-200 bg-white p-2 text-[11px]">
-                  <p className="font-semibold uppercase tracking-wide text-slate-600">Delta View</p>
-                  <div className="mt-2 flex flex-wrap items-center gap-2">
-                    <select
-                      className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px]"
-                      value={referenceMode}
-                      onChange={(event) => setReferenceMode(event.target.value as 'city_average' | 'reference_ward')}
-                    >
-                      <option value="city_average">Compare To City Average</option>
-                      <option value="reference_ward">Compare To Ward</option>
-                    </select>
-                    {referenceMode === 'reference_ward' ? (
-                      <select
-                        className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px]"
-                        value={effectiveReferenceWardId}
-                        onChange={(event) => setReferenceWardId(event.target.value)}
-                      >
-                        {(wardsQuery.data?.wards ?? []).map((ward) => (
-                          <option key={ward.ward_id} value={ward.ward_id}>
-                            {ward.ward_id} {ward.ward_name ? `- ${ward.ward_name}` : ''}
-                          </option>
-                        ))}
-                      </select>
-                    ) : null}
-                  </div>
-                  <p className="mt-1 text-slate-500">Reference: {referenceLabel}</p>
-                  <div className="mt-2 max-h-32 overflow-y-auto rounded border border-slate-200 bg-slate-50 p-2">
-                    {deltaRows.slice(0, 12).map((row) => (
-                      <div key={row.metric_id} className="mb-1 border-b border-slate-200 pb-1 last:mb-0 last:border-b-0 last:pb-0">
-                        <p className="font-medium">{row.label}</p>
-                        <p className="text-slate-500">{row.metric_id}</p>
-                        <p>
-                          Current: {formatMetricNumber(row.current)} {row.unit} | Ref: {formatMetricNumber(row.reference)} {row.unit}
-                        </p>
-                        <p className={row.deltaAbs >= 0 ? 'text-emerald-700' : 'text-rose-700'}>
-                          Delta: {row.deltaAbs >= 0 ? '+' : ''}
-                          {formatMetricNumber(row.deltaAbs)} {row.unit}
-                          {row.deltaPct !== null ? ` (${row.deltaPct >= 0 ? '+' : ''}${row.deltaPct.toFixed(1)}%)` : ''}
-                        </p>
-                      </div>
-                    ))}
-                    {deltaRows.length === 0 ? (
-                      <p className="text-slate-500">No numeric overlaps with the selected reference.</p>
-                    ) : null}
-                  </div>
-                </div>
-
-                <div className="max-h-72 space-y-2 overflow-y-auto rounded border border-slate-200 bg-white p-2">
+                <div className="mt-4 max-h-[28rem] space-y-3 overflow-y-auto rounded-[22px] border border-stone-200 bg-stone-50 p-3">
                   {metricPanelGroups.map((group) => (
-                    <div key={group.key} className="space-y-1">
-                      <p className="font-semibold uppercase tracking-wide text-slate-600">{group.label}</p>
+                    <div key={group.key} className="space-y-2">
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">{group.label}</p>
                       {group.metrics.map((metric) => (
-                        <div key={metric.metric_id} className="rounded border border-slate-200 bg-slate-50 p-2">
-                          <div className="flex items-start justify-between gap-2">
+                        <div key={metric.metric_id} className="rounded-2xl border border-stone-200 bg-white p-3">
+                          <div className="flex items-start justify-between gap-3">
                             <div>
-                              <p className="font-medium">{metric.label}</p>
+                              <p className="font-semibold text-slate-900">{metric.label}</p>
                               <p className="text-[11px] text-slate-500">{metric.metric_id}</p>
                             </div>
-                            <p className="text-right text-sm font-semibold">
+                            <p className="text-right text-sm font-semibold text-slate-900">
                               {metric.valueDisplay}
                               <span className="ml-1 text-[11px] font-normal text-slate-500">{metric.unit}</span>
                             </p>
                           </div>
-                          <p className="mt-1 text-[11px] text-slate-600">{metric.explanation}</p>
-                          <div className="mt-1 flex gap-1">
-                            <span className={`rounded border px-1.5 py-0.5 text-[10px] ${statusBadgeClass(metric.status)}`}>
-                              {metric.status}
-                            </span>
-                            <span className={`rounded border px-1.5 py-0.5 text-[10px] ${qualityBadgeClass(metric.qualityFlag)}`}>
-                              {metric.qualityFlag}
-                            </span>
+                          <p className="mt-2 text-[12px] leading-5 text-slate-600">{metric.explanation}</p>
+                          <div className="mt-2 flex flex-wrap gap-1">
+                            <span className={`rounded-full border px-2 py-1 text-[10px] ${statusBadgeClass(metric.status)}`}>{metric.status}</span>
+                            <span className={`rounded-full border px-2 py-1 text-[10px] ${qualityBadgeClass(metric.qualityFlag)}`}>{metric.qualityFlag}</span>
                           </div>
                         </div>
                       ))}
                     </div>
                   ))}
-                  {metricPanelGroups.length === 0 ? <p className="text-slate-500">No metric rows to display.</p> : null}
                 </div>
               </>
             )}
+          </details>
 
-            {selectedWardIds.length > 1 ? (
-              <p className="rounded border border-slate-200 bg-white p-2">
-                Multi-select rows returned: {collectionCount}
-              </p>
-            ) : null}
-          </section>
-
-          <section className="mt-4 space-y-2 text-xs">
-            <h2 className="font-semibold uppercase tracking-wide text-slate-600">Compare Mode</h2>
-            <div className="rounded border border-slate-200 bg-white p-2">
-              <p>Left: {compareLeft ? compareLeft.title : 'Not set'}</p>
-              <p>Right: {compareRight ? compareRight.title : 'Not set'}</p>
-            </div>
-            <button
-              type="button"
-              className="rounded border border-slate-400 bg-white px-2 py-1 text-[11px]"
-              onClick={() => {
-                setCompareLeft(null)
-                setCompareRight(null)
-              }}
-            >
-              Clear Compare Slots
-            </button>
-            {compareLeft && compareRight ? (
-              <div className="max-h-44 overflow-y-auto rounded border border-slate-200 bg-white p-2">
-                {sideBySideRows.slice(0, 14).map((row) => (
-                  <div key={row.metric_id} className="mb-1 border-b border-slate-200 pb-1 last:mb-0 last:border-b-0 last:pb-0">
-                    <p className="font-medium">{row.label}</p>
-                    <p className="text-slate-500">{row.metric_id}</p>
-                    <p>
-                      L: {formatMetricNumber(row.leftValue)} {row.unit} | R: {formatMetricNumber(row.rightValue)} {row.unit}
-                    </p>
-                    <p className={row.deltaAbs >= 0 ? 'text-emerald-700' : 'text-rose-700'}>
-                      Delta: {row.deltaAbs >= 0 ? '+' : ''}
-                      {formatMetricNumber(row.deltaAbs)} {row.unit}
-                      {row.deltaPct !== null ? ` (${row.deltaPct >= 0 ? '+' : ''}${row.deltaPct.toFixed(1)}%)` : ''}
-                    </p>
-                  </div>
-                ))}
-                {sideBySideRows.length === 0 ? <p className="text-slate-500">No numeric overlap between selected areas.</p> : null}
-              </div>
-            ) : (
-              <p className="text-slate-500">Set Left and Right from the metric panel to enable side-by-side compare.</p>
-            )}
-          </section>
-
-          {cityError || wardError || metricError || cityAverageError || referenceWardError ? (
-            <section className="mt-4 rounded border border-red-200 bg-red-50 p-2 text-xs text-red-700">
+          {cityError || wardError || metricError || cityAverageError || fullMetricError || roadLayerError || transitLayerError ? (
+            <section className="mt-4 rounded-2xl border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">
               {cityError ? <p>{cityError}</p> : null}
               {wardError ? <p>{wardError}</p> : null}
               {metricError ? <p>{metricError}</p> : null}
               {cityAverageError ? <p>{cityAverageError}</p> : null}
-              {referenceWardError ? <p>{referenceWardError}</p> : null}
+              {fullMetricError ? <p>{fullMetricError}</p> : null}
+              {roadLayerError ? <p>{roadLayerError}</p> : null}
+              {transitLayerError ? <p>{transitLayerError}</p> : null}
             </section>
           ) : null}
         </aside>
 
-        <main className="col-span-12 md:col-span-8 lg:col-span-9">
-          <div ref={mapContainerRef} className="h-full w-full" />
+        <main className="urbanmor-mapframe col-span-12 overflow-hidden rounded-[30px] md:col-span-8 lg:col-span-9">
+          <div className="relative h-full w-full">
+            <div ref={mapContainerRef} className="h-full w-full" />
+
+            <div className="absolute left-4 top-4 z-10 max-w-sm rounded-[22px] border border-white/70 bg-white/92 p-4 shadow-lg backdrop-blur pointer-events-none">
+              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">How to use</p>
+              <p className="mt-2 text-sm leading-6 text-slate-700">
+                Click wards to add or remove them from the AOI. Draw a polygon when the area does not align to administrative boundaries.
+                Analysis starts as soon as the shape is finished.
+              </p>
+            </div>
+
+            <div className="absolute right-4 top-4 z-10 w-[18rem] rounded-[24px] border border-white/70 bg-white/92 p-4 shadow-lg backdrop-blur">
+              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Map view</p>
+              <div className="mt-3 flex rounded-full bg-stone-100 p-1 text-xs font-semibold text-slate-600">
+                <button
+                  type="button"
+                  className={`flex-1 rounded-full px-3 py-2 transition ${basemapMode === 'street' ? 'bg-white text-slate-950 shadow-sm' : ''}`}
+                  onClick={() => setBasemapMode('street')}
+                >
+                  Street
+                </button>
+                <button
+                  type="button"
+                  className={`flex-1 rounded-full px-3 py-2 transition ${basemapMode === 'satellite' ? 'bg-white text-slate-950 shadow-sm' : ''}`}
+                  onClick={() => setBasemapMode('satellite')}
+                >
+                  Satellite
+                </button>
+              </div>
+
+              <div className="mt-4 grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  className={`rounded-2xl border px-3 py-2 text-xs font-semibold transition ${showRoadOverlay ? 'border-amber-300 bg-amber-50 text-amber-900' : 'border-stone-300 bg-white text-slate-600'}`}
+                  onClick={() => setShowRoadOverlay((current) => !current)}
+                >
+                  {showRoadOverlay ? 'Roads on' : 'Roads off'}
+                </button>
+                <button
+                  type="button"
+                  className={`rounded-2xl border px-3 py-2 text-xs font-semibold transition ${showTransitOverlay ? 'border-cyan-300 bg-cyan-50 text-cyan-900' : 'border-stone-300 bg-white text-slate-600'}`}
+                  onClick={() => setShowTransitOverlay((current) => !current)}
+                >
+                  {showTransitOverlay ? 'Transit on' : 'Transit off'}
+                </button>
+              </div>
+
+              <label className="mt-4 block text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Ward shading</label>
+              <select
+                className="mt-2 w-full rounded-2xl border border-stone-300 bg-white px-3 py-3 text-sm outline-none transition focus:border-cyan-600 focus:ring-2 focus:ring-cyan-100"
+                value={effectiveMetricId}
+                onChange={(event) => setActiveMetricId(event.target.value)}
+              >
+                {mapMetricOptions.map((metric: MetricMetaItem) => (
+                  <option key={metric.metric_id} value={metric.metric_id}>
+                    {metric.label}
+                  </option>
+                ))}
+              </select>
+              <p className="mt-2 text-[11px] text-slate-500">
+                {mapMetricOptions.find((metric) => metric.metric_id === effectiveMetricId)?.formula_summary ?? 'Selected ward metric for map shading.'}
+              </p>
+              <div
+                className="mt-3 h-2 rounded-full"
+                style={{
+                  background: `linear-gradient(90deg, ${CHOROPLETH_COLOR_STOPS.low} 0%, ${CHOROPLETH_COLOR_STOPS.mid} 35%, ${CHOROPLETH_COLOR_STOPS.high} 70%, ${CHOROPLETH_COLOR_STOPS.max} 100%)`,
+                }}
+              />
+              <div className="mt-2 flex items-center justify-between text-[10px] text-slate-500">
+                <span>Lower</span>
+                <span>
+                  {metricRange.min === null ? 'n/a' : metricRange.min.toFixed(2)} to {metricRange.max === null ? 'n/a' : metricRange.max.toFixed(2)}
+                </span>
+                <span>Higher</span>
+              </div>
+            </div>
+
+            <div className="pointer-events-none absolute bottom-4 left-4 z-10 rounded-[20px] border border-white/70 bg-white/90 px-4 py-3 text-sm text-slate-700 shadow-lg backdrop-blur">
+              {isDrawInteractionMode(drawMode)
+                ? 'Drawing/editing is active. Ward clicks are paused until the edit finishes.'
+                : 'Click wards to build the AOI. The panel on the left stays focused on one area at a time.'}
+            </div>
+          </div>
         </main>
       </div>
     </div>

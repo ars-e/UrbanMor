@@ -2,9 +2,9 @@ metric_id,metric_name,home,method_state,default_value_state,prereq_audit,prereq_
 bldg.avg_footprint_size,Average Building Footprint Size,buildings,direct,not_computed,ok,,confidence_high|not_computed|prereq_ok,High,planned,final,compute_bldg_avg_footprint_size,prereq_audit=ok
 bldg.avg_interbuilding_distance,Average Distance Between Buildings,buildings,direct,not_computed,ok,,confidence_medium|not_computed|prereq_ok,Medium,planned,final,compute_bldg_avg_interbuilding_distance,prereq_audit=ok
 bldg.bcr,Building Coverage Ratio (BCR),buildings,direct,not_computed,ok,,confidence_high|not_computed|prereq_ok,High,planned,final,compute_bldg_bcr,prereq_audit=ok
-bldg.clustering_coeff,Building Clustering Coefficient,buildings,direct,not_computed,ok,,confidence_medium|not_computed|prereq_ok,Medium,planned,final,compute_bldg_clustering_coeff,prereq_audit=ok
+bldg.clustering_coeff,Building Clustering Coefficient,buildings,direct,not_computed,ok,,confidence_medium|not_computed|prereq_ok,Medium,planned,final,compute_bldg_clustering_coeff,60m centroid-neighbor graph; averaged local clustering coefficient. | prereq_audit=ok
 bldg.density_per_ha,Building Density,buildings,direct,not_computed,ok,,confidence_high|not_computed|prereq_ok,High,planned,final,compute_bldg_density_per_ha,prereq_audit=ok
-bldg.edge_coverage,Edge Coverage (road frontage),buildings,direct,not_computed,ok,,confidence_low_medium|not_computed|prereq_ok,Low-Medium,planned,final,compute_bldg_edge_coverage,prereq_audit=ok
+bldg.edge_coverage,Edge Coverage (road frontage),buildings,proxy_only,not_computed,ok,,confidence_low_medium|proxy_method|not_computed|prereq_ok,Low-Medium,proxy_only,final,compute_bldg_edge_coverage,20m road-sample proxy with 15m building proximity; badge required in UI. | prereq_audit=ok
 bldg.elongation,Building Elongation,buildings,direct,not_computed,ok,,confidence_medium|not_computed|prereq_ok,Medium,planned,final,compute_bldg_elongation,prereq_audit=ok
 bldg.far_proxy,Floor Area Ratio proxy,buildings,proxy_only,not_computed,usable_with_caveats,building_levels_tags,confidence_low|proxy_method|not_computed|prereq_caveated,Low,proxy_only,final,compute_bldg_far_proxy,Proxy definition; badge required in UI. | prereq_audit=usable_with_caveats:building_levels_tags
 bldg.footprint_regularity,Footprint Regularity,buildings,direct,not_computed,ok,,confidence_medium|not_computed|prereq_ok,Medium,planned,final,compute_bldg_footprint_regularity,prereq_audit=ok
@@ -32,7 +32,7 @@ open.riparian_buffer_integrity,Riparian Buffer Integrity,landuse,direct,not_comp
 open.vacant_land_pct,Vacant Land %,landuse,direct,not_computed,ok,,confidence_medium|not_computed|prereq_ok,Medium,planned,final,compute_open_vacant_land_pct,prereq_audit=ok
 road.avg_block_size,Average Block Size,roads,direct,not_computed,ok,,confidence_medium|not_computed|prereq_ok,Medium,planned,final,compute_road_avg_block_size,prereq_audit=ok
 road.block_size_variance,Block Size Variance,roads,direct,not_computed,ok,,confidence_medium|not_computed|prereq_ok,Medium,planned,final,compute_road_block_size_variance,prereq_audit=ok
-road.circuity,Circuity,roads,direct,not_computed,ok,,confidence_low_medium|not_computed|prereq_ok,Low-Medium,planned,final,compute_road_circuity,prereq_audit=ok
+road.circuity,Circuity,roads,proxy_only,not_computed,ok,,confidence_low_medium|proxy_method|not_computed|prereq_ok,Low-Medium,proxy_only,final,compute_road_circuity,Segment-sinuosity proxy; not OD routing circuity. | prereq_audit=ok
 road.cnr,Connected Node Ratio (CNR),roads,direct,not_computed,ok,,confidence_medium|not_computed|prereq_ok,Medium,planned,final,compute_road_cnr,prereq_audit=ok
 road.culdesac_ratio,Cul-de-sac Ratio,roads,direct,not_computed,ok,,confidence_medium|not_computed|prereq_ok,Medium,planned,final,compute_road_culdesac_ratio,prereq_audit=ok
 road.edge_density,Edge Density,roads,direct,not_computed,ok,,confidence_high|not_computed|prereq_ok,High,planned,final,compute_road_edge_density,prereq_audit=ok

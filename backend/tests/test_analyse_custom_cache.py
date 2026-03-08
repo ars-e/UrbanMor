@@ -64,6 +64,7 @@ def test_custom_polygon_async_polling(client) -> None:
             "mode": "custom_polygon",
             "city": "delhi",
             "geometry": geom,
+            "run_async": True,
         },
     )
     assert enqueue.status_code == 202

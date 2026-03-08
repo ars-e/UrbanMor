@@ -87,6 +87,7 @@ BEGIN
 END;
 $$;
 
+-- Area in square kilometres using the WGS84 spheroid (accurate; avoids Web Mercator distortion).
 CREATE OR REPLACE FUNCTION metrics._area_sqkm(p_geom geometry)
 RETURNS double precision
 LANGUAGE plpgsql
@@ -94,37 +95,40 @@ IMMUTABLE
 AS $$
 DECLARE
   v_geom_4326 geometry(MultiPolygon, 4326);
-  v_area_m2 double precision;
+  v_area_m2   double precision;
 BEGIN
   v_geom_4326 := metrics._normalize_polygon_geom(p_geom);
   IF v_geom_4326 IS NULL THEN
     RETURN NULL;
   END IF;
 
-  v_area_m2 := ST_Area(metrics._to_3857(v_geom_4326));
+  v_area_m2 := ST_Area(v_geom_4326::geography);
   IF v_area_m2 <= 0 THEN
     RETURN NULL;
   END IF;
 
-  RETURN v_area_m2 / 1000000.0;
+  RETURN v_area_m2 / 1_000_000.0;
 END;
 $$;
 
 -- Shared clipped-road graph derivation:
 -- - clips roads to input polygon (projected),
 -- - nodes edges, then derives node degree and orientation entropy.
+-- - also returns optional block-size stats from _network_blocks (NULL if table absent).
 CREATE OR REPLACE FUNCTION metrics._road_graph_stats(
   p_city text,
   p_geom geometry
 )
 RETURNS TABLE (
-  edge_count bigint,
-  node_count bigint,
-  connected_node_count bigint,
-  intersection_count bigint,
-  culdesac_count bigint,
-  edge_length_m double precision,
-  orientation_entropy_bits double precision
+  edge_count              bigint,
+  node_count              bigint,
+  connected_node_count    bigint,
+  intersection_count      bigint,
+  culdesac_count          bigint,
+  edge_length_m           double precision,
+  orientation_entropy_bits double precision,
+  avg_block_size_m2       double precision,
+  block_size_variance_m2  double precision
 )
 LANGUAGE plpgsql
 STABLE
@@ -134,6 +138,10 @@ DECLARE
   v_geom_4326 geometry(MultiPolygon, 4326);
   v_geom_3857 geometry;
   v_sql text;
+  v_blocks_table text;
+  v_blocks_sql text;
+  v_avg_block double precision;
+  v_var_block double precision;
 BEGIN
   v_city := metrics._normalize_city(p_city);
   v_geom_4326 := metrics._normalize_polygon_geom(p_geom);
@@ -141,13 +149,17 @@ BEGIN
 
   IF v_geom_4326 IS NULL OR v_geom_3857 IS NULL THEN
     RETURN QUERY
-    SELECT 0::bigint, 0::bigint, 0::bigint, 0::bigint, 0::bigint, 0::double precision, NULL::double precision;
+    SELECT 0::bigint, 0::bigint, 0::bigint, 0::bigint, 0::bigint,
+           0::double precision, NULL::double precision,
+           NULL::double precision, NULL::double precision;
     RETURN;
   END IF;
 
   IF to_regclass(format('%I.%I', 'transport', v_city || '_roads_normalized')) IS NULL THEN
     RETURN QUERY
-    SELECT 0::bigint, 0::bigint, 0::bigint, 0::bigint, 0::bigint, 0::double precision, NULL::double precision;
+    SELECT 0::bigint, 0::bigint, 0::bigint, 0::bigint, 0::bigint,
+           0::double precision, NULL::double precision,
+           NULL::double precision, NULL::double precision;
     RETURN;
   END IF;
 
@@ -185,7 +197,7 @@ BEGIN
     edges AS (
       SELECT
         geom,
-        ST_Length(geom)::double precision AS length_m
+        ST_Length(ST_Transform(geom, 4326)::geography)::double precision AS length_m
       FROM noded_edges
       WHERE geom IS NOT NULL
         AND NOT ST_IsEmpty(geom)
@@ -241,7 +253,41 @@ BEGIN
       (SELECT h_bits FROM entropy)::double precision AS orientation_entropy_bits
   $SQL$, 'transport', v_city || '_roads_normalized');
 
-  RETURN QUERY EXECUTE v_sql USING v_geom_3857;
+  -- Fetch main graph stats
+  EXECUTE v_sql
+  INTO edge_count, node_count, connected_node_count, intersection_count, culdesac_count,
+       edge_length_m, orientation_entropy_bits
+  USING v_geom_3857;
+
+  -- Optional block stats: check if _network_blocks table exists, return NULL if not.
+  v_blocks_table := format('%I.%I', 'transport', v_city || '_network_blocks');
+  IF to_regclass(v_blocks_table) IS NOT NULL THEN
+    v_blocks_sql := format($SQL$
+      WITH clipped AS (
+        SELECT
+          ST_Area(ST_Intersection(b.geom, $2)::geography)::double precision AS area_m2
+        FROM %I.%I b
+        WHERE b.geom IS NOT NULL
+          AND NOT ST_IsEmpty(b.geom)
+          AND b.geom && $2
+          AND ST_Intersects(b.geom, $2)
+      )
+      SELECT
+        AVG(area_m2)::double precision,
+        VAR_POP(area_m2)::double precision
+      FROM clipped
+      WHERE area_m2 > 1.0
+    $SQL$, 'transport', v_city || '_network_blocks');
+    EXECUTE v_blocks_sql INTO v_avg_block, v_var_block USING v_geom_3857, v_geom_4326;
+  ELSE
+    v_avg_block := NULL;
+    v_var_block := NULL;
+  END IF;
+
+  avg_block_size_m2      := v_avg_block;
+  block_size_variance_m2 := v_var_block;
+
+  RETURN NEXT;
 END;
 $$;
 
@@ -283,11 +329,12 @@ DECLARE
   v_stats record;
 BEGIN
   SELECT * INTO v_stats FROM metrics._road_graph_stats(p_city, p_geom);
-  IF COALESCE(v_stats.node_count, 0) = 0 THEN
+  IF COALESCE(v_stats.intersection_count, 0) + COALESCE(v_stats.culdesac_count, 0) = 0 THEN
     RETURN NULL;
   END IF;
 
-  RETURN (v_stats.connected_node_count::double precision / v_stats.node_count::double precision) * 100.0;
+  RETURN (v_stats.intersection_count::double precision /
+    (v_stats.intersection_count + v_stats.culdesac_count)::double precision) * 100.0;
 END;
 $$;
 
@@ -344,39 +391,10 @@ LANGUAGE plpgsql
 STABLE
 AS $$
 DECLARE
-  v_city text;
-  v_geom_4326 geometry(MultiPolygon, 4326);
-  v_geom_3857 geometry;
-  v_sql text;
-  v_val double precision;
+  v_stats record;
 BEGIN
-  v_city := metrics._normalize_city(p_city);
-  v_geom_4326 := metrics._normalize_polygon_geom(p_geom);
-  IF v_geom_4326 IS NULL THEN
-    RETURN NULL;
-  END IF;
-  v_geom_3857 := metrics._to_3857(v_geom_4326);
-
-  IF to_regclass(format('%I.%I', 'transport', v_city || '_network_blocks')) IS NULL THEN
-    RETURN NULL;
-  END IF;
-
-  v_sql := format($SQL$
-    WITH clipped AS (
-      SELECT
-        ST_Area(ST_Intersection(metrics._to_3857(b.geom), $1))::double precision AS area_m2
-      FROM %I.%I b
-      WHERE b.geom IS NOT NULL
-        AND NOT ST_IsEmpty(b.geom)
-        AND ST_Intersects(metrics._to_3857(b.geom), $1)
-    )
-    SELECT AVG(area_m2)::double precision
-    FROM clipped
-    WHERE area_m2 > 1.0
-  $SQL$, 'transport', v_city || '_network_blocks');
-
-  EXECUTE v_sql INTO v_val USING v_geom_3857;
-  RETURN v_val;
+  SELECT * INTO v_stats FROM metrics._road_graph_stats(p_city, p_geom);
+  RETURN v_stats.avg_block_size_m2;
 END;
 $$;
 
@@ -389,39 +407,10 @@ LANGUAGE plpgsql
 STABLE
 AS $$
 DECLARE
-  v_city text;
-  v_geom_4326 geometry(MultiPolygon, 4326);
-  v_geom_3857 geometry;
-  v_sql text;
-  v_val double precision;
+  v_stats record;
 BEGIN
-  v_city := metrics._normalize_city(p_city);
-  v_geom_4326 := metrics._normalize_polygon_geom(p_geom);
-  IF v_geom_4326 IS NULL THEN
-    RETURN NULL;
-  END IF;
-  v_geom_3857 := metrics._to_3857(v_geom_4326);
-
-  IF to_regclass(format('%I.%I', 'transport', v_city || '_network_blocks')) IS NULL THEN
-    RETURN NULL;
-  END IF;
-
-  v_sql := format($SQL$
-    WITH clipped AS (
-      SELECT
-        ST_Area(ST_Intersection(metrics._to_3857(b.geom), $1))::double precision AS area_m2
-      FROM %I.%I b
-      WHERE b.geom IS NOT NULL
-        AND NOT ST_IsEmpty(b.geom)
-        AND ST_Intersects(metrics._to_3857(b.geom), $1)
-    )
-    SELECT VAR_POP(area_m2)::double precision
-    FROM clipped
-    WHERE area_m2 > 1.0
-  $SQL$, 'transport', v_city || '_network_blocks');
-
-  EXECUTE v_sql INTO v_val USING v_geom_3857;
-  RETURN v_val;
+  SELECT * INTO v_stats FROM metrics._road_graph_stats(p_city, p_geom);
+  RETURN v_stats.block_size_variance_m2;
 END;
 $$;
 
@@ -468,6 +457,7 @@ BEGIN
 END;
 $$;
 
+-- NOTE: measures per-segment sinuosity (path/chord), not OD route circuity.
 CREATE OR REPLACE FUNCTION metrics.compute_road_circuity(
   p_city text,
   p_geom geometry
@@ -570,7 +560,6 @@ DECLARE
   v_city text;
   v_area_sqkm double precision;
   v_geom_4326 geometry(MultiPolygon, 4326);
-  v_geom_3857 geometry;
   v_sql text;
   v_val jsonb;
 BEGIN
@@ -581,7 +570,6 @@ BEGIN
   IF v_geom_4326 IS NULL OR v_area_sqkm IS NULL OR v_area_sqkm <= 0 THEN
     RETURN NULL;
   END IF;
-  v_geom_3857 := metrics._to_3857(v_geom_4326);
 
   IF to_regclass(format('%I.%I', 'transport', v_city || '_roads_normalized')) IS NULL THEN
     RETURN NULL;
@@ -591,18 +579,19 @@ BEGIN
     WITH clipped AS (
       SELECT
         COALESCE(NULLIF(lower(r.highway), ''), 'unknown') AS highway_class,
-        ST_Length(
-          (ST_Dump(
+        COALESCE((
+          SELECT SUM(ST_Length((d).geom::geography))
+          FROM ST_Dump(
             ST_CollectionExtract(
-              ST_MakeValid(ST_Intersection(metrics._to_3857(r.geom), $1)),
+              ST_MakeValid(ST_Intersection(r.geom, $1)),
               2
             )
-          )).geom
-        )::double precision / 1000.0 AS length_km
+          ) AS d
+        ), 0.0)::double precision / 1000.0 AS length_km
       FROM %I.%I r
       WHERE r.geom IS NOT NULL
         AND NOT ST_IsEmpty(r.geom)
-        AND ST_Intersects(metrics._to_3857(r.geom), $1)
+        AND ST_Intersects(r.geom, $1)
     ),
     agg AS (
       SELECT highway_class, SUM(length_km)::double precision AS length_km
@@ -624,7 +613,7 @@ BEGIN
     )
   $SQL$, 'transport', v_city || '_roads_normalized');
 
-  EXECUTE v_sql INTO v_val USING v_geom_3857, v_area_sqkm;
+  EXECUTE v_sql INTO v_val USING v_geom_4326, v_area_sqkm;
   RETURN v_val;
 END;
 $$;
@@ -640,7 +629,6 @@ AS $$
 DECLARE
   v_city text;
   v_geom_4326 geometry(MultiPolygon, 4326);
-  v_geom_3857 geometry;
   v_sql text;
   v_val double precision;
   v_ped_table_exists boolean;
@@ -650,7 +638,6 @@ BEGIN
   IF v_geom_4326 IS NULL THEN
     RETURN NULL;
   END IF;
-  v_geom_3857 := metrics._to_3857(v_geom_4326);
 
   v_ped_table_exists := to_regclass(format('%I.%I', 'transport', v_city || '_roads_pedestrian_enriched')) IS NOT NULL;
 
@@ -658,19 +645,20 @@ BEGIN
     v_sql := format($SQL$
       WITH clipped AS (
         SELECT
-          ST_Length(
-            (ST_Dump(
+          COALESCE((
+            SELECT SUM(ST_Length((d).geom::geography))
+            FROM ST_Dump(
               ST_CollectionExtract(
-                ST_MakeValid(ST_Intersection(metrics._to_3857(r.geom), $1)),
+                ST_MakeValid(ST_Intersection(r.geom, $1)),
                 2
               )
-            )).geom
-          )::double precision AS length_m,
+            ) AS d
+          ), 0.0)::double precision AS length_m,
           COALESCE(r.is_pedestrian_link, FALSE) AS is_ped
         FROM %I.%I r
         WHERE r.geom IS NOT NULL
           AND NOT ST_IsEmpty(r.geom)
-          AND ST_Intersects(metrics._to_3857(r.geom), $1)
+          AND ST_Intersects(r.geom, $1)
       ),
       agg AS (
         SELECT
@@ -690,14 +678,15 @@ BEGIN
     v_sql := format($SQL$
       WITH clipped AS (
         SELECT
-          ST_Length(
-            (ST_Dump(
+          COALESCE((
+            SELECT SUM(ST_Length((d).geom::geography))
+            FROM ST_Dump(
               ST_CollectionExtract(
-                ST_MakeValid(ST_Intersection(metrics._to_3857(r.geom), $1)),
+                ST_MakeValid(ST_Intersection(r.geom, $1)),
                 2
               )
-            )).geom
-          )::double precision AS length_m,
+            ) AS d
+          ), 0.0)::double precision AS length_m,
           CASE
             WHEN r.source_layer = 'walkability_access' THEN TRUE
             WHEN lower(COALESCE(r.highway, '')) IN ('footway', 'pedestrian', 'path', 'steps', 'living_street', 'cycleway', 'track') THEN TRUE
@@ -708,7 +697,7 @@ BEGIN
         FROM %I.%I r
         WHERE r.geom IS NOT NULL
           AND NOT ST_IsEmpty(r.geom)
-          AND ST_Intersects(metrics._to_3857(r.geom), $1)
+          AND ST_Intersects(r.geom, $1)
       ),
       agg AS (
         SELECT
@@ -728,7 +717,7 @@ BEGIN
     RETURN NULL;
   END IF;
 
-  EXECUTE v_sql INTO v_val USING v_geom_3857;
+  EXECUTE v_sql INTO v_val USING v_geom_4326;
   RETURN v_val;
 END;
 $$;
@@ -804,7 +793,6 @@ AS $$
 DECLARE
   v_city text;
   v_geom_4326 geometry(MultiPolygon, 4326);
-  v_geom_3857 geometry;
   v_sql text;
   v_val double precision;
 BEGIN
@@ -813,7 +801,6 @@ BEGIN
   IF v_geom_4326 IS NULL THEN
     RETURN NULL;
   END IF;
-  v_geom_3857 := metrics._to_3857(v_geom_4326);
 
   IF to_regclass(format('%I.%I', 'transport', v_city || '_transit_normalized')) IS NULL THEN
     RETURN NULL;
@@ -821,11 +808,13 @@ BEGIN
 
   v_sql := format($SQL$
     WITH g AS (
-      SELECT $1::geometry(MultiPolygon, 3857) AS geom
+      SELECT
+        $1::geometry(MultiPolygon, 4326) AS geom,
+        $2::geometry(MultiPolygon, 3857) AS geom_3857
     ),
     targets AS (
       SELECT
-        ST_PointOnSurface(metrics._to_3857(t.geom))::geometry(Point, 3857) AS geom
+        ST_PointOnSurface(metrics._to_4326(t.geom))::geometry(Point, 4326) AS geom
       FROM %I.%I t
       WHERE t.geom IS NOT NULL
         AND NOT ST_IsEmpty(t.geom)
@@ -838,14 +827,17 @@ BEGIN
     ),
     samples AS (
       SELECT
-        ST_PointOnSurface(ST_Intersection(sg.geom, g.geom))::geometry(Point, 3857) AS geom
+        ST_Transform(
+          ST_PointOnSurface(ST_Intersection(sg.geom, g.geom_3857)),
+          4326
+        )::geometry(Point, 4326) AS geom
       FROM g,
-           LATERAL ST_SquareGrid(300.0, g.geom) AS sg
-      WHERE ST_Intersects(sg.geom, g.geom)
+           LATERAL ST_SquareGrid(300.0, g.geom_3857) AS sg
+      WHERE ST_Intersects(sg.geom, g.geom_3857)
       LIMIT 800
     ),
     fallback_sample AS (
-      SELECT ST_PointOnSurface(g.geom)::geometry(Point, 3857) AS geom
+      SELECT ST_PointOnSurface(g.geom)::geometry(Point, 4326) AS geom
       FROM g
       WHERE NOT EXISTS (SELECT 1 FROM samples)
     ),
@@ -857,9 +849,14 @@ BEGIN
     nearest AS (
       SELECT
         (
-          SELECT ST_Distance(s.geom, t.geom)::double precision
-          FROM targets t
-          ORDER BY s.geom <-> t.geom
+          SELECT ST_Distance(s.geom::geography, t.geom::geography)::double precision
+          FROM (
+            SELECT geom
+            FROM targets t
+            ORDER BY s.geom <-> t.geom
+            LIMIT 8
+          ) t
+          ORDER BY ST_Distance(s.geom::geography, t.geom::geography)
           LIMIT 1
         ) AS nearest_m
       FROM all_samples s
@@ -869,7 +866,7 @@ BEGIN
     WHERE nearest_m IS NOT NULL
   $SQL$, 'transport', v_city || '_transit_normalized');
 
-  EXECUTE v_sql INTO v_val USING v_geom_3857;
+  EXECUTE v_sql INTO v_val USING v_geom_4326, metrics._to_3857(v_geom_4326);
   RETURN v_val;
 END;
 $$;
@@ -902,7 +899,8 @@ BEGIN
 
   v_sql := format($SQL$
     WITH g AS (
-      SELECT $1::geometry(MultiPolygon, 3857) AS geom
+      SELECT $1::geometry(MultiPolygon, 3857) AS geom,
+             $2::geometry(MultiPolygon, 4326) AS geom_4326
     ),
     stops AS (
       SELECT
@@ -928,14 +926,23 @@ BEGIN
     )
     SELECT
       CASE
-        WHEN ST_Area(g.geom) <= 0 THEN NULL
+        WHEN ST_Area((SELECT geom_4326 FROM g)::geography) <= 0 THEN NULL
         WHEN (SELECT geom FROM unioned) IS NULL THEN 0.0
-        ELSE (ST_Area(ST_Intersection((SELECT geom FROM unioned), g.geom)) / ST_Area(g.geom)) * 100.0
+        ELSE (
+          ST_Area(
+            ST_Intersection(
+              ST_Transform((SELECT geom FROM unioned), 4326),
+              (SELECT geom_4326 FROM g)
+            )::geography
+          ) /
+          ST_Area((SELECT geom_4326 FROM g)::geography)
+        ) * 100.0
       END::double precision AS coverage_pct
     FROM g
+    LIMIT 1
   $SQL$, 'transport', v_city || '_transit_normalized');
 
-  EXECUTE v_sql INTO v_val USING v_geom_3857;
+  EXECUTE v_sql INTO v_val USING v_geom_3857, v_geom_4326;
   RETURN v_val;
 END;
 $$;
@@ -975,12 +982,17 @@ BEGIN
     v_edge_density := (COALESCE(v_stats.edge_length_m, 0.0) / 1000.0) / v_area_sqkm;
   END IF;
 
-  IF COALESCE(v_stats.node_count, 0) = 0 THEN
+  IF COALESCE(v_stats.intersection_count, 0) + COALESCE(v_stats.culdesac_count, 0) = 0 THEN
     v_cnr := NULL;
+  ELSE
+    v_cnr := (v_stats.intersection_count::double precision /
+      (v_stats.intersection_count + v_stats.culdesac_count)::double precision) * 100.0;
+  END IF;
+
+  IF COALESCE(v_stats.node_count, 0) = 0 THEN
     v_connectivity_idx := NULL;
     v_culdesac_ratio := NULL;
   ELSE
-    v_cnr := (v_stats.connected_node_count::double precision / v_stats.node_count::double precision) * 100.0;
     v_connectivity_idx := LEAST(
       100.0,
       GREATEST(0.0, ((v_stats.edge_count::double precision / v_stats.node_count::double precision) / 3.0) * 100.0)
@@ -993,8 +1005,8 @@ BEGIN
     'road.cnr', v_cnr,
     'road.node_density', v_node_density,
     'road.edge_density', v_edge_density,
-    'road.avg_block_size', metrics.compute_road_avg_block_size(p_city, p_geom),
-    'road.block_size_variance', metrics.compute_road_block_size_variance(p_city, p_geom),
+    'road.avg_block_size', v_stats.avg_block_size_m2,
+    'road.block_size_variance', v_stats.block_size_variance_m2,
     'road.street_connectivity_index', v_connectivity_idx,
     'road.culdesac_ratio', v_culdesac_ratio,
     'road.circuity', metrics.compute_road_circuity(p_city, p_geom),

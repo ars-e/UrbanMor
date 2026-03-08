@@ -417,19 +417,28 @@ def build_builtup_vacant_flood_rasters(city: str) -> None:
 
         DROP TABLE IF EXISTS dem.{c}_flood_risk_proxy CASCADE;
         CREATE TABLE dem.{c}_flood_risk_proxy AS
-        SELECT
-          1::bigint AS rid,
-          ST_MapAlgebra(
-            d.rast,
-            1,
-            s.rast,
-            1,
-            'CASE WHEN ([rast1] <= {threshold} AND [rast2] <= 5) THEN 1 ELSE 0 END',
-            '8BUI',
-            'INTERSECTION'
-          ) AS rast
-        FROM dem.{c}_dem_normalized d
-        CROSS JOIN dem.{c}_slope_deg_normalized s;
+        WITH paired AS (
+          SELECT
+            row_number() OVER ()::bigint AS rid,
+            ST_MapAlgebra(
+              d.rast,
+              1,
+              CASE
+                WHEN ST_SameAlignment(d.rast, s.rast) THEN s.rast
+                ELSE ST_Resample(s.rast, d.rast)
+              END,
+              1,
+              'CASE WHEN ([rast1] <= {threshold} AND [rast2] <= 5) THEN 1 ELSE 0 END',
+              '8BUI',
+              'INTERSECTION'
+            ) AS rast
+          FROM dem.{c}_dem_normalized d
+          JOIN dem.{c}_slope_deg_normalized s
+            ON ST_Intersects(d.rast, s.rast)
+        )
+        SELECT rid, rast
+        FROM paired
+        WHERE rast IS NOT NULL;
         ALTER TABLE dem.{c}_flood_risk_proxy ADD PRIMARY KEY (rid);
         CREATE INDEX {c}_flood_risk_rast_idx ON dem.{c}_flood_risk_proxy USING GIST (ST_ConvexHull(rast));
         ANALYZE dem.{c}_flood_risk_proxy;

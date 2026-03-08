@@ -108,9 +108,6 @@ function qualityFlagForValue(value: unknown): string {
     if (!Number.isFinite(value)) {
       return 'invalid_numeric'
     }
-    if (value === 0) {
-      return 'zero'
-    }
     return 'ok'
   }
   if (typeof value === 'object') {
@@ -258,12 +255,6 @@ function escapeCsv(value: string): string {
   return value
 }
 
-function toCsv(headers: string[], row: Record<string, string>): string {
-  const headerLine = headers.map(escapeCsv).join(',')
-  const valueLine = headers.map((header) => escapeCsv(row[header] ?? '')).join(',')
-  return `${headerLine}\n${valueLine}\n`
-}
-
 export function makeMetricsExportJson(
   context: ExportContext,
   rows: MetricPanelRow[],
@@ -284,27 +275,47 @@ export function makeMetricsExportCsv(
   context: ExportContext,
   rows: MetricPanelRow[],
 ): string {
-  const base: Record<string, string> = {
-    generated_at: new Date().toISOString(),
+  const headers = [
+    'generated_at',
+    'city',
+    'source_type',
+    'source_id',
+    'metric_id',
+    'label',
+    'family',
+    'unit',
+    'value',
+    'value_display',
+    'status',
+    'quality_flag',
+  ]
+
+  const generatedAt = new Date().toISOString()
+  const contextFields: Record<string, string> = {
+    generated_at: generatedAt,
     city: context.city,
     source_type: context.sourceType,
     source_id: context.sourceId,
   }
 
-  for (const [key, value] of Object.entries(context.qualitySummary ?? {})) {
-    base[`quality_summary__${key}`] = toCsvValue(value)
-  }
+  const lines: string[] = [headers.map(escapeCsv).join(',')]
 
   for (const row of rows) {
-    base[row.metric_id] = toCsvValue(row.value)
-    base[`${row.metric_id}__label`] = row.label
-    base[`${row.metric_id}__unit`] = row.unit
-    base[`${row.metric_id}__status`] = row.status
-    base[`${row.metric_id}__quality`] = row.qualityFlag
+    const record: Record<string, string> = {
+      ...contextFields,
+      metric_id: row.metric_id,
+      label: row.label,
+      family: row.frontendGroup,
+      unit: row.unit,
+      value: toCsvValue(row.value),
+      value_display: row.valueDisplay,
+      status: row.status,
+      quality_flag: row.qualityFlag,
+    }
+    lines.push(headers.map((h) => escapeCsv(record[h] ?? '')).join(','))
   }
 
-  const headers = Object.keys(base)
-  return toCsv(headers, base)
+  return lines.join('\n') + '\n'
 }
 
 export function downloadTextFile(fileName: string, content: string, mimeType: string): void {

@@ -23,7 +23,7 @@ WHERE NOT EXISTS (
 -- Spatial + text/search helpers used across ingestion and metrics workflows.
 CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS postgis_raster;
-CREATE EXTENSION IF NOT EXISTS postgis_topology;
+-- postgis_topology intentionally omitted (not used in this schema).
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS unaccent;
 

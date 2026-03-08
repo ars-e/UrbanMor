@@ -1,12 +1,21 @@
 @import 'maplibre-gl/dist/maplibre-gl.css';
 @import '@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css';
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&display=swap');
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 :root {
-  font-family: 'IBM Plex Sans', 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+  --um-paper: #f5efe3;
+  --um-paper-soft: rgba(255, 252, 247, 0.92);
+  --um-ink: #0f172a;
+  --um-muted: #475569;
+  --um-accent: #0f766e;
+  --um-accent-soft: rgba(15, 118, 110, 0.12);
+  --um-shadow: 0 22px 48px rgba(15, 23, 42, 0.12);
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
+  color-scheme: light;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
@@ -21,6 +30,70 @@ body,
   height: 100%;
 }
 
+body {
+  background:
+    radial-gradient(circle at 10% 10%, rgba(249, 115, 22, 0.12), transparent 26%),
+    radial-gradient(circle at 90% 10%, rgba(8, 145, 178, 0.15), transparent 30%),
+    linear-gradient(180deg, #f9f5ed 0%, #f3ede4 100%);
+}
+
+.urbanmor-shell {
+  font-family: 'IBM Plex Sans', sans-serif;
+}
+
+.urbanmor-shell h1,
+.urbanmor-shell h2,
+.urbanmor-shell h3 {
+  font-family: 'Space Grotesk', sans-serif;
+  letter-spacing: -0.03em;
+}
+
+.urbanmor-masthead {
+  background:
+    radial-gradient(circle at top left, rgba(251, 191, 36, 0.28), transparent 32%),
+    linear-gradient(135deg, #0f172a 0%, #1e293b 55%, #0f766e 100%);
+  box-shadow: var(--um-shadow);
+}
+
+.urbanmor-sidebar {
+  background: var(--um-paper-soft);
+  border: 1px solid rgba(214, 211, 209, 0.85);
+  box-shadow: var(--um-shadow);
+  backdrop-filter: blur(18px);
+}
+
+.urbanmor-mapframe {
+  background: rgba(255, 252, 247, 0.88);
+  border: 1px solid rgba(214, 211, 209, 0.85);
+  box-shadow: var(--um-shadow);
+}
+
+.maplibregl-ctrl-group {
+  border-radius: 18px;
+  border: 1px solid rgba(214, 211, 209, 0.9);
+  box-shadow: 0 14px 30px rgba(15, 23, 42, 0.12);
+  overflow: hidden;
+}
+
+.maplibregl-ctrl-group button {
+  width: 40px;
+  height: 40px;
+  background: rgba(255, 252, 247, 0.96);
+  color: var(--um-ink);
+}
+
+.maplibregl-canvas {
+  outline: none;
+}
+
+.maplibregl-ctrl-group button:not(:last-child) {
+  border-bottom: 1px solid rgba(214, 211, 209, 0.8);
+}
+
+.maplibregl-ctrl-group button:hover {
+  background: rgba(254, 243, 199, 0.95);
+}
+
 .maplibregl-popup-content {
-  border-radius: 6px;
+  border-radius: 16px;
 }

@@ -28,6 +28,7 @@ CREATE TEMP TABLE qa_vector_summary (
   empty_geom_count BIGINT,
   null_geom_count BIGINT,
   srid_missing_count BIGINT,
+  srid_non_4326_count BIGINT,
   impossible_bbox_count BIGINT,
   layer_extent TEXT,
   duplicate_key_column TEXT,
@@ -41,6 +42,7 @@ CREATE TEMP TABLE qa_raster_summary (
   tile_count BIGINT,
   empty_raster_count BIGINT,
   srid_missing_count BIGINT,
+  srid_non_4326_count BIGINT,
   impossible_bbox_count BIGINT,
   layer_extent TEXT
 );
@@ -141,6 +143,10 @@ BEGIN
           )::bigint AS srid_missing_count,
           count(*) FILTER (
             WHERE geom IS NOT NULL
+              AND ST_SRID(geom) NOT IN (0, 4326)
+          )::bigint AS srid_non_4326_count,
+          count(*) FILTER (
+            WHERE geom IS NOT NULL
               AND NOT ST_IsEmpty(geom)
               AND ST_SRID(geom) = 4326
               AND (
@@ -158,12 +164,12 @@ BEGIN
       )
       INSERT INTO qa_vector_summary (
         table_schema, table_name, row_count, invalid_geom_count, empty_geom_count,
-        null_geom_count, srid_missing_count, impossible_bbox_count, layer_extent,
+        null_geom_count, srid_missing_count, srid_non_4326_count, impossible_bbox_count, layer_extent,
         duplicate_key_column, duplicate_key_count
       )
       SELECT
         %L, %L, agg.row_count, agg.invalid_geom_count, agg.empty_geom_count,
-        agg.null_geom_count, agg.srid_missing_count, agg.impossible_bbox_count,
+        agg.null_geom_count, agg.srid_missing_count, agg.srid_non_4326_count, agg.impossible_bbox_count,
         agg.layer_extent, %s, dup.duplicate_key_count
       FROM agg, dup;
       $fmt$,
@@ -192,22 +198,33 @@ BEGIN
     EXECUTE q;
 
     -- metadata-level CRS check (vector)
-    INSERT INTO qa_crs_metadata (table_schema, table_name, layer_type, metadata_srid, metadata_issue)
-    SELECT
-      r.table_schema,
-      r.table_name,
-      'vector',
-      gc.srid,
-      CASE
-        WHEN gc.srid IS NULL THEN 'missing_in_geometry_columns'
-        WHEN gc.srid = 0 THEN 'undefined_srid'
-        ELSE NULL
-      END
-    FROM geometry_columns gc
-    WHERE gc.f_table_schema = r.table_schema
-      AND gc.f_table_name = r.table_name
-      AND gc.f_geometry_column = 'geom'
-      AND (gc.srid IS NULL OR gc.srid = 0);
+    IF EXISTS (
+      SELECT 1
+      FROM geometry_columns gc
+      WHERE gc.f_table_schema = r.table_schema
+        AND gc.f_table_name = r.table_name
+        AND gc.f_geometry_column = 'geom'
+    ) THEN
+      INSERT INTO qa_crs_metadata (table_schema, table_name, layer_type, metadata_srid, metadata_issue)
+      SELECT
+        r.table_schema,
+        r.table_name,
+        'vector',
+        gc.srid,
+        CASE
+          WHEN gc.srid IS NULL THEN 'missing_in_geometry_columns'
+          WHEN gc.srid = 0 THEN 'undefined_srid'
+          ELSE NULL
+        END
+      FROM geometry_columns gc
+      WHERE gc.f_table_schema = r.table_schema
+        AND gc.f_table_name = r.table_name
+        AND gc.f_geometry_column = 'geom'
+        AND (gc.srid IS NULL OR gc.srid = 0);
+    ELSE
+      INSERT INTO qa_crs_metadata (table_schema, table_name, layer_type, metadata_srid, metadata_issue)
+      VALUES (r.table_schema, r.table_name, 'vector', NULL, 'missing_in_geometry_columns');
+    END IF;
   END LOOP;
 
   -- ---------------------------
@@ -231,7 +248,7 @@ BEGIN
         FROM %I.%I
       )
       INSERT INTO qa_raster_summary (
-        table_schema, table_name, tile_count, empty_raster_count, srid_missing_count,
+        table_schema, table_name, tile_count, empty_raster_count, srid_missing_count, srid_non_4326_count,
         impossible_bbox_count, layer_extent
       )
       SELECT
@@ -240,6 +257,7 @@ BEGIN
         count(*)::bigint AS tile_count,
         count(*) FILTER (WHERE ST_IsEmpty(rast))::bigint AS empty_raster_count,
         count(*) FILTER (WHERE ST_SRID(rast) = 0)::bigint AS srid_missing_count,
+        count(*) FILTER (WHERE ST_SRID(rast) NOT IN (0, 4326))::bigint AS srid_non_4326_count,
         count(*) FILTER (
           WHERE ST_SRID(rast) = 4326 AND (
             ST_XMin(ST_Envelope(rast)) < -180 OR ST_XMax(ST_Envelope(rast)) > 180 OR
@@ -256,22 +274,33 @@ BEGIN
     EXECUTE q;
 
     -- metadata-level CRS check (raster)
-    INSERT INTO qa_crs_metadata (table_schema, table_name, layer_type, metadata_srid, metadata_issue)
-    SELECT
-      r.table_schema,
-      r.table_name,
-      'raster',
-      rc.srid,
-      CASE
-        WHEN rc.srid IS NULL THEN 'missing_in_raster_columns'
-        WHEN rc.srid = 0 THEN 'undefined_srid'
-        ELSE NULL
-      END
-    FROM raster_columns rc
-    WHERE rc.r_table_schema = r.table_schema
-      AND rc.r_table_name = r.table_name
-      AND rc.r_raster_column = 'rast'
-      AND (rc.srid IS NULL OR rc.srid = 0);
+    IF EXISTS (
+      SELECT 1
+      FROM raster_columns rc
+      WHERE rc.r_table_schema = r.table_schema
+        AND rc.r_table_name = r.table_name
+        AND rc.r_raster_column = 'rast'
+    ) THEN
+      INSERT INTO qa_crs_metadata (table_schema, table_name, layer_type, metadata_srid, metadata_issue)
+      SELECT
+        r.table_schema,
+        r.table_name,
+        'raster',
+        rc.srid,
+        CASE
+          WHEN rc.srid IS NULL THEN 'missing_in_raster_columns'
+          WHEN rc.srid = 0 THEN 'undefined_srid'
+          ELSE NULL
+        END
+      FROM raster_columns rc
+      WHERE rc.r_table_schema = r.table_schema
+        AND rc.r_table_name = r.table_name
+        AND rc.r_raster_column = 'rast'
+        AND (rc.srid IS NULL OR rc.srid = 0);
+    ELSE
+      INSERT INTO qa_crs_metadata (table_schema, table_name, layer_type, metadata_srid, metadata_issue)
+      VALUES (r.table_schema, r.table_name, 'raster', NULL, 'missing_in_raster_columns');
+    END IF;
   END LOOP;
 
   -- ---------------------------
@@ -352,6 +381,7 @@ SELECT
   empty_geom_count,
   null_geom_count,
   srid_missing_count,
+  srid_non_4326_count,
   impossible_bbox_count,
   duplicate_key_column,
   duplicate_key_count,
@@ -366,6 +396,7 @@ SELECT
   tile_count,
   empty_raster_count,
   srid_missing_count,
+  srid_non_4326_count,
   impossible_bbox_count,
   layer_extent
 FROM qa_raster_summary
@@ -393,12 +424,12 @@ ORDER BY table_schema, table_name, layer_type;
 -- 5) Rollup severity (quick scan)
 SELECT
   'vector' AS layer_type,
-  sum(invalid_geom_count + empty_geom_count + null_geom_count + srid_missing_count + impossible_bbox_count + COALESCE(duplicate_key_count, 0)) AS total_issues
+  sum(invalid_geom_count + empty_geom_count + null_geom_count + srid_missing_count + srid_non_4326_count + impossible_bbox_count + COALESCE(duplicate_key_count, 0)) AS total_issues
 FROM qa_vector_summary
 UNION ALL
 SELECT
   'raster' AS layer_type,
-  sum(empty_raster_count + srid_missing_count + impossible_bbox_count) AS total_issues
+  sum(empty_raster_count + srid_missing_count + srid_non_4326_count + impossible_bbox_count) AS total_issues
 FROM qa_raster_summary
 UNION ALL
 SELECT

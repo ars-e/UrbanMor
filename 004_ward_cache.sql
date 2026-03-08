@@ -13,6 +13,25 @@ SET search_path = public, metrics, boundaries, meta;
 
 CREATE SCHEMA IF NOT EXISTS metrics;
 
+-- Define _normalize_city locally so 004_ward_cache.sql can run standalone
+-- (canonical definition is in sql/000_metric_helpers.sql and sql/roads_metrics.sql).
+CREATE OR REPLACE FUNCTION metrics._normalize_city(p_city TEXT)
+RETURNS TEXT
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+  v_city TEXT;
+BEGIN
+  v_city := lower(trim(COALESCE(p_city, '')));
+  v_city := regexp_replace(v_city, '[^a-z0-9_]+', '', 'g');
+  IF v_city = '' THEN
+    RAISE EXCEPTION 'Invalid city identifier: %', p_city;
+  END IF;
+  RETURN v_city;
+END;
+$$;
+
 -- Compact cache-level quality rollup derived from metrics.analyse_polygon payload.
 CREATE OR REPLACE FUNCTION metrics._metric_quality_summary(p_metrics_json jsonb)
 RETURNS jsonb
@@ -104,6 +123,10 @@ CREATE INDEX IF NOT EXISTS idx_ward_cache_quality_summary_gin
   ON metrics.ward_cache
   USING GIN (quality_summary jsonb_path_ops);
 
+-- Supports latest-row lookup by (city, ward_id) without sorting.
+CREATE INDEX IF NOT EXISTS idx_ward_cache_city_ward_latest
+  ON metrics.ward_cache (city, ward_id, vintage_year DESC, computed_at DESC);
+
 CREATE OR REPLACE VIEW metrics.ward_cache_latest AS
 SELECT DISTINCT ON (city, ward_id)
   city,
@@ -135,6 +158,12 @@ DECLARE
   v_city_filter text;
   v_sql text;
 BEGIN
+  -- Advisory lock prevents duplicate concurrent computation for the same city+year.
+  -- Lock key is a hash of the city filter (or 'all') combined with the vintage year.
+  PERFORM pg_advisory_xact_lock(
+    hashtext(COALESCE(p_city_filter, 'all') || ':' || p_vintage_year::text)
+  );
+
   IF p_vintage_year < 1900 OR p_vintage_year > 2100 THEN
     RAISE EXCEPTION 'p_vintage_year out of range (1900-2100): %', p_vintage_year;
   END IF;
@@ -223,4 +252,3 @@ BEGIN
   END LOOP;
 END;
 $$;
-

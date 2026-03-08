@@ -74,10 +74,19 @@ def normalize_ward_id(v: object) -> str:
     return s
 
 
+def normalize_ward_name(v: object) -> str:
+    if v is None:
+        return ''
+    s = str(v).strip().lower()
+    if s == '' or s in {'nan', 'none', 'null'}:
+        return ''
+    return re.sub(r'[^a-z0-9]+', '', s)
+
+
 def pick_join_key(city: str, ward_id_norm: str, ward_name_norm: str) -> str:
-    if city in {'chennai', 'mumbai'} and ward_name_norm:
-        return ward_name_norm
-    return ward_id_norm
+    if ward_id_norm:
+        return ward_id_norm
+    return ward_name_norm
 
 
 def run_sql_copy(sql: str) -> pd.DataFrame:
@@ -139,7 +148,7 @@ def fetch_observed_metrics() -> pd.DataFrame:
     df = df.rename(columns=rename)
     df['city'] = df['city'].str.strip().str.lower()
     df['ward_id_norm'] = df['ward_id'].map(normalize_ward_id)
-    df['ward_name_norm'] = df['ward_name'].map(normalize_ward_id)
+    df['ward_name_norm'] = df['ward_name'].map(normalize_ward_name)
     df['join_key'] = [
         pick_join_key(city, ward_id_norm, ward_name_norm)
         for city, ward_id_norm, ward_name_norm in zip(df['city'], df['ward_id_norm'], df['ward_name_norm'])
@@ -152,6 +161,10 @@ def build_reference_lulc() -> pd.DataFrame:
     df = pd.read_csv(p)
     df['city'] = df['city'].astype(str).str.strip().str.lower()
     df['ward_id_norm'] = df['ward_id'].map(normalize_ward_id)
+    if 'ward_name' in df.columns:
+        df['ward_name_norm'] = df['ward_name'].map(normalize_ward_name)
+    else:
+        df['ward_name_norm'] = ''
 
     area_cols = [c for c in df.columns if c.startswith('area_sqkm_class_')]
     for c in area_cols:
@@ -188,7 +201,10 @@ def build_reference_lulc() -> pd.DataFrame:
         {
             'city': df['city'],
             'ward_id_norm': df['ward_id_norm'],
-            'join_key': df['ward_id_norm'],
+            'join_key': [
+                pick_join_key(city, ward_id_norm, ward_name_norm)
+                for city, ward_id_norm, ward_name_norm in zip(df['city'], df['ward_id_norm'], df['ward_name_norm'])
+            ],
             'lulc.green_cover_pct_ref': (green_sqkm / total) * 100.0,
             'lulc.mix_index_ref': mix_vals,
             'lulc.residential_cover_pct_ref': (res_sqkm / total) * 100.0,
@@ -206,6 +222,10 @@ def build_reference_dem() -> pd.DataFrame:
     df = pd.read_csv(p)
     df['city'] = df['city'].astype(str).str.strip().str.lower()
     df['ward_id_norm'] = df['ward_id'].map(normalize_ward_id)
+    if 'ward_name' in df.columns:
+        df['ward_name_norm'] = df['ward_name'].map(normalize_ward_name)
+    else:
+        df['ward_name_norm'] = ''
 
     for c in ['elev_mean_m', 'elev_min_m', 'elev_max_m', 'slope_mean_deg', 'slope_gt_15deg_pct']:
         df[c] = pd.to_numeric(df[c], errors='coerce')
@@ -214,7 +234,10 @@ def build_reference_dem() -> pd.DataFrame:
         {
             'city': df['city'],
             'ward_id_norm': df['ward_id_norm'],
-            'join_key': df['ward_id_norm'],
+            'join_key': [
+                pick_join_key(city, ward_id_norm, ward_name_norm)
+                for city, ward_id_norm, ward_name_norm in zip(df['city'], df['ward_id_norm'], df['ward_name_norm'])
+            ],
             'topo.mean_elevation_ref': df['elev_mean_m'],
             'topo.elevation_range_ref': df['elev_max_m'] - df['elev_min_m'],
             'topo.mean_slope_ref': df['slope_mean_deg'],

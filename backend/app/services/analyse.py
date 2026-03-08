@@ -28,6 +28,7 @@ from app.schemas.cities import (
     WardSummary,
 )
 from app.schemas.health import HealthResponse
+from app.schemas.map_layers import CityMapLayerGeoJSONResponse, MapLayerFeature
 from app.schemas.meta import MetaMetricsResponse, MetricMetaItem
 from app.schemas.metrics import WardMetricResponse
 
@@ -37,6 +38,15 @@ _BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 _JOB_SEMAPHORE = asyncio.Semaphore(2)
 _JOBS_TABLE_READY = False
 _JOBS_TABLE_LOCK = asyncio.Lock()
+_TRANSIT_POINT_LAYERS = (
+    "metro_stations",
+    "rail_stations",
+    "public_transport_stations",
+    "public_transport_stops",
+    "public_transport_platforms",
+    "metro_entrances",
+)
+_TRANSIT_POINT_LAYER_SQL = ", ".join(f"'{layer}'" for layer in _TRANSIT_POINT_LAYERS)
 
 
 def _cleanup_background_task(task: asyncio.Task[Any]) -> None:
@@ -82,6 +92,39 @@ class AnalyseService:
             raise HTTPException(status_code=400, detail="Invalid city format")
         return normalized
 
+    @staticmethod
+    def _parse_bbox(bbox: str) -> tuple[float, float, float, float]:
+        try:
+            west, south, east, north = (float(part.strip()) for part in bbox.split(","))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="bbox must be west,south,east,north") from exc
+
+        if not (-180.0 <= west <= 180.0 and -180.0 <= east <= 180.0 and -90.0 <= south <= 90.0 and -90.0 <= north <= 90.0):
+            raise HTTPException(status_code=400, detail="bbox coordinates out of range")
+        if west >= east or south >= north:
+            raise HTTPException(status_code=400, detail="bbox must satisfy west < east and south < north")
+        return west, south, east, north
+
+    @staticmethod
+    def _road_detail(detail: str | None, zoom: float | None) -> str:
+        if detail in {"major", "full"}:
+            return detail
+        if zoom is not None and zoom >= 12:
+            return "full"
+        return "major"
+
+    @staticmethod
+    def _road_simplify_tolerance_m(zoom: float | None) -> float:
+        if zoom is None:
+            return 20.0
+        if zoom >= 14:
+            return 1.5
+        if zoom >= 12:
+            return 4.0
+        if zoom >= 10:
+            return 12.0
+        return 30.0
+
     async def _resolve_city_ward_table(self, city: str) -> str:
         normalized = self._normalize_city(city)
         table_name = f"{normalized}_wards_normalized"
@@ -105,47 +148,10 @@ class AnalyseService:
         global _JOBS_TABLE_READY
         if _JOBS_TABLE_READY:
             return
-
         async with _JOBS_TABLE_LOCK:
             if _JOBS_TABLE_READY:
                 return
-
-            await self._execute("jobs.schema", "CREATE SCHEMA IF NOT EXISTS meta")
-            await self._execute(
-                "jobs.table",
-                """
-                CREATE TABLE IF NOT EXISTS meta.analysis_jobs (
-                  job_id text PRIMARY KEY,
-                  mode text NOT NULL,
-                  city text NOT NULL,
-                  payload_json jsonb NOT NULL,
-                  status text NOT NULL,
-                  progress_pct integer NOT NULL DEFAULT 0,
-                  progress_message text,
-                  result_json jsonb,
-                  error_text text,
-                  created_at timestamptz NOT NULL DEFAULT now(),
-                  started_at timestamptz,
-                  completed_at timestamptz,
-                  updated_at timestamptz NOT NULL DEFAULT now()
-                )
-                """,
-            )
-            await self._execute(
-                "jobs.index_status",
-                """
-                CREATE INDEX IF NOT EXISTS analysis_jobs_status_created_idx
-                ON meta.analysis_jobs(status, created_at DESC)
-                """,
-            )
-            await self._execute(
-                "jobs.index_city",
-                """
-                CREATE INDEX IF NOT EXISTS analysis_jobs_city_created_idx
-                ON meta.analysis_jobs(city, created_at DESC)
-                """,
-            )
-            await self.session.commit()
+            # Table and indexes are managed by alembic migration 0002_create_analysis_jobs.
             _JOBS_TABLE_READY = True
 
     @staticmethod
@@ -266,43 +272,32 @@ class AnalyseService:
 
         row = (
             await self._execute(
-                "jobs.get_payload",
+                "jobs.claim",
                 """
-                SELECT
+                UPDATE meta.analysis_jobs
+                SET
+                  status='running',
+                  progress_pct=20,
+                  progress_message='Running analysis',
+                  started_at=COALESCE(started_at, now()),
+                  updated_at=now(),
+                  error_text=NULL
+                WHERE job_id=:job_id
+                  AND status NOT IN ('succeeded', 'failed', 'running')
+                RETURNING
                   job_id,
                   city,
                   payload_json,
                   status
-                FROM meta.analysis_jobs
-                WHERE job_id=:job_id
                 """,
                 {"job_id": job_id},
             )
         ).mappings().first()
 
         if row is None:
-            logger.error("analysis_job_not_found job_id=%s", job_id)
+            # Job already completed, claimed by another worker, or not found.
             return
 
-        status_value = str(row["status"])
-        if status_value in {"succeeded", "failed"}:
-            return
-
-        await self._execute(
-            "jobs.mark_running",
-            """
-            UPDATE meta.analysis_jobs
-            SET
-              status='running',
-              progress_pct=20,
-              progress_message='Running analysis',
-              started_at=COALESCE(started_at, now()),
-              updated_at=now(),
-              error_text=NULL
-            WHERE job_id=:job_id
-            """,
-            {"job_id": job_id},
-        )
         await self.session.commit()
 
         payload_json = row["payload_json"]
@@ -313,17 +308,33 @@ class AnalyseService:
 
         try:
             await self._execute(
-                "jobs.progress_compute",
+                "jobs.progress_prepare",
                 """
                 UPDATE meta.analysis_jobs
                 SET
-                  progress_pct=60,
-                  progress_message='Computing metric payload',
+                  progress_pct=35,
+                  progress_message='Normalizing geometry and checking cache',
                   updated_at=now()
                 WHERE job_id=:job_id
                 """,
                 {"job_id": job_id},
             )
+            await self.session.commit()
+
+            await self._execute(
+                "jobs.progress_compute",
+                """
+                UPDATE meta.analysis_jobs
+                SET
+                  progress_pct=65,
+                  progress_message='Computing metrics (large polygons can take longer)',
+                  updated_at=now()
+                WHERE job_id=:job_id
+                """,
+                {"job_id": job_id},
+            )
+            await self.session.commit()
+
             result = await self._analyse_custom_polygon(city, geometry, vintage_year)
 
             await self._execute(
@@ -397,34 +408,50 @@ class AnalyseService:
             )
         ).mappings().all()
 
+        if not city_rows:
+            return CitiesResponse(cities=[])
+
+        city_names = [row["city"] for row in city_rows]
+
+        # Batch query: cached wards per city for current year
+        cached_rows = (
+            await self._execute(
+                "cities.cached_wards_batch",
+                """
+                SELECT city, COUNT(*) AS cached_wards
+                FROM metrics.ward_cache
+                WHERE city = ANY(:cities)
+                  AND vintage_year = EXTRACT(YEAR FROM CURRENT_DATE)::int
+                GROUP BY city
+                """,
+                {"cities": city_names},
+            )
+        ).mappings().all()
+        cached_by_city: dict[str, int] = {row["city"]: int(row["cached_wards"]) for row in cached_rows}
+
+        # Batch query: expected wards per city (UNION of all ward tables)
+        # Build a UNION ALL query dynamically — one COUNT per city table
+        # table_name validated by information_schema LIKE filter above
+        union_sql = " UNION ALL ".join(
+            f"SELECT '{row['city']}'::text AS city, COUNT(*)::int AS expected_wards FROM boundaries.\"{row['table_name']}\""
+            for row in city_rows
+        )
+        expected_rows = (
+            await self._execute("cities.expected_wards_batch", union_sql)
+        ).mappings().all()
+        expected_by_city: dict[str, int] = {row["city"]: int(row["expected_wards"]) for row in expected_rows}
+
         cities: list[CitySummary] = []
         for row in city_rows:
             city = row["city"]
-            table_name = row["table_name"]
-
-            expected_wards = await self._scalar(
-                "cities.expected_wards",
-                f"SELECT COUNT(*) FROM boundaries.{table_name}",
-            )
-            cached_wards = await self._scalar(
-                "cities.cached_wards",
-                """
-                SELECT COUNT(*)
-                FROM metrics.ward_cache
-                WHERE city=:city
-                  AND vintage_year=EXTRACT(YEAR FROM CURRENT_DATE)::int
-                """,
-                {"city": city},
-            )
-            expected_wards = int(expected_wards or 0)
-            cached_wards = int(cached_wards or 0)
-            pct = (cached_wards / expected_wards * 100.0) if expected_wards > 0 else 0.0
-
+            expected = expected_by_city.get(city, 0)
+            cached = cached_by_city.get(city, 0)
+            pct = (cached / expected * 100.0) if expected > 0 else 0.0
             cities.append(
                 CitySummary(
                     city=city,
-                    expected_wards=expected_wards,
-                    cached_wards=cached_wards,
+                    expected_wards=expected,
+                    cached_wards=cached,
                     completeness_pct=round(pct, 1),
                 )
             )
@@ -497,6 +524,218 @@ class AnalyseService:
         ]
 
         return CityWardsGeoJSONResponse(city=normalized, features=features)
+
+    async def list_city_roads_geojson(
+        self,
+        city: str,
+        bbox: str,
+        zoom: float | None = None,
+        detail: str | None = None,
+    ) -> CityMapLayerGeoJSONResponse:
+        normalized = self._normalize_city(city)
+        west, south, east, north = self._parse_bbox(bbox)
+        detail_mode = self._road_detail(detail, zoom)
+        tolerance_m = self._road_simplify_tolerance_m(zoom)
+        table_name = f"{normalized}_roads_normalized"
+
+        exists = await self._scalar(
+            "roads.layer.table_exists",
+            """
+            SELECT EXISTS (
+              SELECT 1
+              FROM information_schema.tables
+              WHERE table_schema='transport'
+                AND table_name=:table_name
+            )
+            """,
+            {"table_name": table_name},
+        )
+        if not exists:
+            raise HTTPException(status_code=404, detail=f"Road layer not found for city: {normalized}")
+
+        if detail_mode == "major":
+            highway_filter = """
+              AND lower(COALESCE(r.highway, '')) IN (
+                'motorway', 'motorway_link',
+                'trunk', 'trunk_link',
+                'primary', 'primary_link',
+                'secondary', 'secondary_link',
+                'tertiary', 'tertiary_link'
+              )
+            """
+            limit = 6000
+        else:
+            highway_filter = """
+              AND lower(COALESCE(r.highway, '')) NOT IN (
+                'footway', 'path', 'steps', 'track', 'cycleway', 'crossing'
+              )
+            """
+            limit = 12000
+
+        rows = (
+            await self._execute(
+                "roads.layer.geojson",
+                f"""
+                WITH bounds AS (
+                  SELECT ST_MakeEnvelope(:west, :south, :east, :north, 4326) AS geom
+                ),
+                src AS (
+                  SELECT
+                    COALESCE(NULLIF(lower(r.highway), ''), 'unknown') AS road_class,
+                    CASE
+                      WHEN lower(COALESCE(r.highway, '')) IN ('motorway', 'motorway_link', 'trunk', 'trunk_link') THEN 4
+                      WHEN lower(COALESCE(r.highway, '')) IN ('primary', 'primary_link') THEN 3
+                      WHEN lower(COALESCE(r.highway, '')) IN ('secondary', 'secondary_link') THEN 2
+                      ELSE 1
+                    END AS style_rank,
+                    ST_AsGeoJSON(
+                      ST_Transform(
+                        ST_SimplifyPreserveTopology(
+                          ST_Transform(
+                            ST_CollectionExtract(ST_MakeValid(ST_Intersection(r.geom, b.geom)), 2),
+                            3857
+                          ),
+                          :tolerance_m
+                        ),
+                        4326
+                      ),
+                      5
+                    )::jsonb AS geometry
+                  FROM transport.{table_name} r
+                  CROSS JOIN bounds b
+                  WHERE r.geom IS NOT NULL
+                    AND NOT ST_IsEmpty(r.geom)
+                    AND r.geom && b.geom
+                    AND ST_Intersects(r.geom, b.geom)
+                    {highway_filter}
+                )
+                SELECT road_class, style_rank, geometry
+                FROM src
+                WHERE geometry IS NOT NULL
+                ORDER BY style_rank DESC, road_class
+                LIMIT :limit
+                """,
+                {
+                    "west": west,
+                    "south": south,
+                    "east": east,
+                    "north": north,
+                    "tolerance_m": tolerance_m,
+                    "limit": limit,
+                },
+            )
+        ).mappings().all()
+
+        features = [
+            MapLayerFeature(
+                geometry=row["geometry"],
+                properties={
+                    "road_class": row["road_class"],
+                    "style_rank": int(row["style_rank"]),
+                },
+            )
+            for row in rows
+        ]
+        return CityMapLayerGeoJSONResponse(
+            city=normalized,
+            layer="roads",
+            feature_count=len(features),
+            features=features,
+        )
+
+    async def list_city_transit_geojson(
+        self,
+        city: str,
+        bbox: str,
+    ) -> CityMapLayerGeoJSONResponse:
+        normalized = self._normalize_city(city)
+        west, south, east, north = self._parse_bbox(bbox)
+        table_name = f"{normalized}_transit_normalized"
+
+        exists = await self._scalar(
+            "transit.layer.table_exists",
+            """
+            SELECT EXISTS (
+              SELECT 1
+              FROM information_schema.tables
+              WHERE table_schema='transport'
+                AND table_name=:table_name
+            )
+            """,
+            {"table_name": table_name},
+        )
+        if not exists:
+            raise HTTPException(status_code=404, detail=f"Transit layer not found for city: {normalized}")
+
+        rows = (
+            await self._execute(
+                "transit.layer.geojson",
+                f"""
+                WITH bounds AS (
+                  SELECT ST_MakeEnvelope(:west, :south, :east, :north, 4326) AS geom
+                ),
+                src AS (
+                  SELECT
+                    t.source_layer,
+                    CASE
+                      WHEN t.source_layer IN ('metro_stations', 'metro_entrances') THEN 'metro'
+                      WHEN t.source_layer = 'rail_stations' THEN 'rail'
+                      WHEN t.source_layer = 'public_transport_stations' THEN 'station'
+                      ELSE 'stop'
+                    END AS stop_kind,
+                    ST_AsGeoJSON(
+                      ST_Transform(
+                        ST_PointOnSurface(t.geom),
+                        4326
+                      ),
+                      6
+                    )::jsonb AS geometry
+                  FROM transport.{table_name} t
+                  CROSS JOIN bounds b
+                  WHERE t.geom IS NOT NULL
+                    AND NOT ST_IsEmpty(t.geom)
+                    AND t.geom && b.geom
+                    AND ST_Intersects(t.geom, b.geom)
+                    AND t.source_layer IN ({_TRANSIT_POINT_LAYER_SQL})
+                )
+                SELECT source_layer, stop_kind, geometry
+                FROM src
+                WHERE geometry IS NOT NULL
+                ORDER BY
+                  CASE stop_kind
+                    WHEN 'metro' THEN 1
+                    WHEN 'rail' THEN 2
+                    WHEN 'station' THEN 3
+                    ELSE 4
+                  END,
+                  source_layer
+                LIMIT 5000
+                """,
+                {
+                    "west": west,
+                    "south": south,
+                    "east": east,
+                    "north": north,
+                },
+            )
+        ).mappings().all()
+
+        features = [
+            MapLayerFeature(
+                geometry=row["geometry"],
+                properties={
+                    "source_layer": row["source_layer"],
+                    "stop_kind": row["stop_kind"],
+                },
+            )
+            for row in rows
+        ]
+        return CityMapLayerGeoJSONResponse(
+            city=normalized,
+            layer="transit",
+            feature_count=len(features),
+            features=features,
+        )
 
     async def get_ward_metrics(self, city: str, ward_id: str) -> WardMetricResponse:
         normalized = self._normalize_city(city)

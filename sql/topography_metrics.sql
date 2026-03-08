@@ -79,6 +79,7 @@ BEGIN
 END;
 $$;
 
+-- Area in square kilometres using the WGS84 spheroid (accurate; avoids Web Mercator distortion).
 CREATE OR REPLACE FUNCTION metrics._area_sqkm(p_geom geometry)
 RETURNS double precision
 LANGUAGE plpgsql
@@ -86,19 +87,19 @@ IMMUTABLE
 AS $$
 DECLARE
   v_geom_4326 geometry(MultiPolygon, 4326);
-  v_area_m2 double precision;
+  v_area_m2   double precision;
 BEGIN
   v_geom_4326 := metrics._normalize_polygon_geom(p_geom);
   IF v_geom_4326 IS NULL THEN
     RETURN NULL;
   END IF;
 
-  v_area_m2 := ST_Area(metrics._to_3857(v_geom_4326));
+  v_area_m2 := ST_Area(v_geom_4326::geography);
   IF v_area_m2 <= 0 THEN
     RETURN NULL;
   END IF;
 
-  RETURN v_area_m2 / 1000000.0;
+  RETURN v_area_m2 / 1_000_000.0;
 END;
 $$;
 
@@ -149,11 +150,12 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION metrics._raster_pct_where(
+-- Returns % of pixels with value > p_threshold.
+CREATE OR REPLACE FUNCTION metrics._raster_pct_above(
   p_schema text,
   p_table text,
   p_geom geometry,
-  p_condition_sql text
+  p_threshold double precision
 )
 RETURNS double precision
 LANGUAGE plpgsql
@@ -188,12 +190,122 @@ BEGIN
       GROUP BY (x).value
     )
     SELECT
-      COALESCE(SUM(CASE WHEN %s THEN cnt ELSE 0 END), 0)::double precision,
+      COALESCE(SUM(CASE WHEN v > $2 THEN cnt ELSE 0 END), 0)::double precision,
       COALESCE(SUM(cnt), 0)::double precision
     FROM vc
-  $SQL$, p_schema, p_table, p_condition_sql);
+  $SQL$, p_schema, p_table);
 
-  EXECUTE v_sql INTO v_true_cnt, v_all_cnt USING v_geom_4326;
+  EXECUTE v_sql INTO v_true_cnt, v_all_cnt USING v_geom_4326, p_threshold;
+
+  IF COALESCE(v_all_cnt, 0.0) <= 0 THEN
+    RETURN NULL;
+  END IF;
+
+  RETURN (v_true_cnt / v_all_cnt) * 100.0;
+END;
+$$;
+
+-- Returns % of pixels with value < p_threshold.
+CREATE OR REPLACE FUNCTION metrics._raster_pct_below(
+  p_schema text,
+  p_table text,
+  p_geom geometry,
+  p_threshold double precision
+)
+RETURNS double precision
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+  v_geom_4326 geometry(MultiPolygon, 4326);
+  v_sql text;
+  v_true_cnt double precision;
+  v_all_cnt double precision;
+BEGIN
+  v_geom_4326 := metrics._normalize_polygon_geom(p_geom);
+  IF v_geom_4326 IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  IF to_regclass(format('%I.%I', p_schema, p_table)) IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  v_sql := format($SQL$
+    WITH clipped AS (
+      SELECT ST_Clip(r.rast, ST_Transform($1, ST_SRID(r.rast)), true) AS rast
+      FROM %I.%I r
+      WHERE ST_Intersects(r.rast, ST_Transform($1, ST_SRID(r.rast)))
+    ), vc AS (
+      SELECT
+        (x).value::double precision AS v,
+        SUM((x).count)::double precision AS cnt
+      FROM clipped c
+      CROSS JOIN LATERAL ST_ValueCount(c.rast, 1, true) x
+      GROUP BY (x).value
+    )
+    SELECT
+      COALESCE(SUM(CASE WHEN v < $2 THEN cnt ELSE 0 END), 0)::double precision,
+      COALESCE(SUM(cnt), 0)::double precision
+    FROM vc
+  $SQL$, p_schema, p_table);
+
+  EXECUTE v_sql INTO v_true_cnt, v_all_cnt USING v_geom_4326, p_threshold;
+
+  IF COALESCE(v_all_cnt, 0.0) <= 0 THEN
+    RETURN NULL;
+  END IF;
+
+  RETURN (v_true_cnt / v_all_cnt) * 100.0;
+END;
+$$;
+
+-- Returns % of pixels with value = p_value.
+CREATE OR REPLACE FUNCTION metrics._raster_pct_equal(
+  p_schema text,
+  p_table text,
+  p_geom geometry,
+  p_value double precision
+)
+RETURNS double precision
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+  v_geom_4326 geometry(MultiPolygon, 4326);
+  v_sql text;
+  v_true_cnt double precision;
+  v_all_cnt double precision;
+BEGIN
+  v_geom_4326 := metrics._normalize_polygon_geom(p_geom);
+  IF v_geom_4326 IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  IF to_regclass(format('%I.%I', p_schema, p_table)) IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  v_sql := format($SQL$
+    WITH clipped AS (
+      SELECT ST_Clip(r.rast, ST_Transform($1, ST_SRID(r.rast)), true) AS rast
+      FROM %I.%I r
+      WHERE ST_Intersects(r.rast, ST_Transform($1, ST_SRID(r.rast)))
+    ), vc AS (
+      SELECT
+        (x).value::double precision AS v,
+        SUM((x).count)::double precision AS cnt
+      FROM clipped c
+      CROSS JOIN LATERAL ST_ValueCount(c.rast, 1, true) x
+      GROUP BY (x).value
+    )
+    SELECT
+      COALESCE(SUM(CASE WHEN v = $2 THEN cnt ELSE 0 END), 0)::double precision,
+      COALESCE(SUM(cnt), 0)::double precision
+    FROM vc
+  $SQL$, p_schema, p_table);
+
+  EXECUTE v_sql INTO v_true_cnt, v_all_cnt USING v_geom_4326, p_value;
 
   IF COALESCE(v_all_cnt, 0.0) <= 0 THEN
     RETURN NULL;
@@ -282,7 +394,7 @@ DECLARE
   v_city text;
 BEGIN
   v_city := metrics._normalize_city(p_city);
-  RETURN metrics._raster_pct_where('dem', v_city || '_slope_deg_normalized', p_geom, 'v > 15.0');
+  RETURN metrics._raster_pct_above('dem', v_city || '_slope_deg_normalized', p_geom, 15.0);
 END;
 $$;
 
@@ -298,7 +410,7 @@ DECLARE
   v_city text;
 BEGIN
   v_city := metrics._normalize_city(p_city);
-  RETURN metrics._raster_pct_where('dem', v_city || '_slope_deg_normalized', p_geom, 'v < 3.0');
+  RETURN metrics._raster_pct_below('dem', v_city || '_slope_deg_normalized', p_geom, 3.0);
 END;
 $$;
 
@@ -314,7 +426,7 @@ DECLARE
   v_city text;
 BEGIN
   v_city := metrics._normalize_city(p_city);
-  RETURN metrics._raster_pct_where('dem', v_city || '_flood_risk_proxy', p_geom, 'v = 1');
+  RETURN metrics._raster_pct_equal('dem', v_city || '_flood_risk_proxy', p_geom, 1.0);
 END;
 $$;
 
@@ -326,11 +438,13 @@ RETURNS double precision
 LANGUAGE plpgsql
 STABLE
 AS $$
+-- Weights: steep_slope(0.5) + flood_proxy(0.3) + water_body(0.2).
+-- These are proxy weights and are not scientifically calibrated.
+-- Factors may overlap (e.g. steep riverbanks counted in both steep and water components).
+-- Treat as indicative ordering only.
 DECLARE
   v_city text;
-  v_area_m2 double precision;
   v_geom_4326 geometry(MultiPolygon, 4326);
-  v_geom_3857 geometry;
   v_steep double precision;
   v_flood double precision;
   v_water_pct double precision := 0.0;
@@ -341,9 +455,7 @@ BEGIN
   v_geom_4326 := metrics._normalize_polygon_geom(p_geom);
   IF v_geom_4326 IS NULL THEN RETURN NULL; END IF;
 
-  v_geom_3857 := metrics._to_3857(v_geom_4326);
-  v_area_m2 := ST_Area(v_geom_3857);
-  IF v_area_m2 <= 0 THEN RETURN NULL; END IF;
+  IF ST_Area(v_geom_4326::geography) <= 0 THEN RETURN NULL; END IF;
 
   v_steep := COALESCE(metrics.compute_topo_steep_area_pct(v_city, v_geom_4326), 0.0);
   v_flood := COALESCE(metrics.compute_topo_flood_risk_proxy(v_city, v_geom_4326), 0.0);
@@ -351,19 +463,19 @@ BEGIN
   IF to_regclass(format('%I.%I', 'green', v_city || '_water_bodies_canonical')) IS NOT NULL THEN
     v_sql := format($SQL$
       WITH clipped AS (
-        SELECT ST_Area(ST_Intersection(metrics._to_3857(w.geom), $1))::double precision AS a
+        SELECT ST_Area(ST_Intersection(w.geom, $1)::geography)::double precision AS a
         FROM %I.%I w
         WHERE w.geom IS NOT NULL
           AND NOT ST_IsEmpty(w.geom)
-          AND ST_Intersects(metrics._to_3857(w.geom), $1)
+          AND ST_Intersects(w.geom, $1)
       )
       SELECT COALESCE(SUM(a), 0)::double precision
       FROM clipped
       WHERE a > 0
     $SQL$, 'green', v_city || '_water_bodies_canonical');
 
-    EXECUTE v_sql INTO v_water_m2 USING v_geom_3857;
-    v_water_pct := (COALESCE(v_water_m2, 0.0) / v_area_m2) * 100.0;
+    EXECUTE v_sql INTO v_water_m2 USING v_geom_4326;
+    v_water_pct := (COALESCE(v_water_m2, 0.0) / ST_Area(v_geom_4326::geography)) * 100.0;
   END IF;
 
   -- Weighted 0-100 index of natural constraints.

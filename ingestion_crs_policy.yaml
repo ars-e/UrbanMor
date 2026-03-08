@@ -7,8 +7,17 @@ storage_crs_by_family:
   buildings: EPSG:4326
   roads_transit: EPSG:4326
   open_spaces: EPSG:4326
-  lulc_raster: EPSG:32643
+  lulc_raster: city_specific_utm_zone
   dem_raster: EPSG:4326
+storage_crs_overrides_by_city:
+  lulc_raster:
+    ahmedabad: EPSG:32643
+    bengaluru: EPSG:32643
+    chandigarh: EPSG:32643
+    chennai: EPSG:32644
+    delhi: EPSG:32643
+    kolkata: EPSG:32645
+    mumbai: EPSG:32643
 analysis_crs_by_metric_family:
   road_network: EPSG:4326
   built_form: EPSG:4326
@@ -18,3 +27,5 @@ analysis_crs_by_metric_family:
 notes:
   - Canonical storage CRS is explicit per family to avoid undefined-CRS outputs.
   - Metric engine may reproject per-request internally if a projected local CRS is required for high-precision distance/area calculations.
+  - All polygon area calculations use ST_Area(geom::geography) for WGS84 spheroid accuracy (avoids Web Mercator distortion of 15-25% at Indian latitudes).
+  - lulc_raster uses city-specific UTM zones (32643/32644/32645); dem_raster stored in EPSG:4326 (geographic). Consider migrating DEM to aligned projected CRS for improved slope precision.

@@ -129,3 +129,19 @@ export interface CityWardsGeoJSONResponse {
   city: string
   features: WardGeometryFeature[]
 }
+
+export type MapRoadFeature = Feature<Geometry, {
+  road_class?: string | null
+  style_rank?: number | null
+}>
+
+export type MapTransitFeature = Feature<Geometry, {
+  source_layer?: string | null
+  stop_kind?: string | null
+}>
+
+export interface CityMapLayerGeoJSONResponse extends FeatureCollection<Geometry, Record<string, string | number | null>> {
+  city: string
+  layer: 'roads' | 'transit'
+  feature_count: number
+}

@@ -3,6 +3,7 @@ import type {
   AnalysePayload,
   AnalyseResponse,
   CitiesResponse,
+  CityMapLayerGeoJSONResponse,
   CityMetricsResponse,
   CityWardsGeoJSONResponse,
   CityWardsResponse,
@@ -43,6 +44,26 @@ export async function getCityWards(city: string): Promise<CityWardsResponse> {
 export async function getCityWardsGeoJSON(city: string): Promise<CityWardsGeoJSONResponse> {
   const response = await fetch(`${API_BASE}/cities/${city}/wards/geojson`)
   return parseResponse<CityWardsGeoJSONResponse>(response)
+}
+
+export async function getCityRoadsGeoJSON(
+  city: string,
+  bbox: string,
+  zoom: number,
+  detail: 'major' | 'full',
+): Promise<CityMapLayerGeoJSONResponse> {
+  const response = await fetch(
+    `${API_BASE}/cities/${city}/roads/geojson?bbox=${encodeURIComponent(bbox)}&zoom=${encodeURIComponent(String(zoom))}&detail=${detail}`,
+  )
+  return parseResponse<CityMapLayerGeoJSONResponse>(response)
+}
+
+export async function getCityTransitGeoJSON(
+  city: string,
+  bbox: string,
+): Promise<CityMapLayerGeoJSONResponse> {
+  const response = await fetch(`${API_BASE}/cities/${city}/transit/geojson?bbox=${encodeURIComponent(bbox)}`)
+  return parseResponse<CityMapLayerGeoJSONResponse>(response)
 }
 
 export async function getCityMetrics(city: string): Promise<CityMetricsResponse> {
