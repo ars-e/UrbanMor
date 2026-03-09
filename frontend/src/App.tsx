@@ -57,6 +57,7 @@ DRAW_CLASSES.CONTROL_GROUP = 'maplibregl-ctrl-group'
 DRAW_CLASSES.ATTRIBUTION = 'maplibregl-ctrl-attrib'
 
 const DEFAULT_METRIC_ID = 'road.intersection_density'
+const RETIRED_METRIC_IDS = new Set(['bldg.growth_rate', 'topo.flood_risk_proxy'])
 const CHOROPLETH_COLOR_STOPS = {
   low: '#f5f1e6',
   mid: '#f59e0b',
@@ -255,7 +256,7 @@ function describeAoi(source: PanelSourceType, city: string, selectedFeatures: Wa
 
   return {
     title: `${city || 'City'} baseline`,
-    subtitle: 'City-wide ward averages. Select wards or draw a polygon for a true AOI.',
+    subtitle: 'City-wide baseline aggregated from latest ward metrics.',
     areaLabel: 'n/a',
   }
 }
@@ -434,13 +435,29 @@ function App() {
     enabled: Boolean(effectiveCity),
   })
 
+  const cityFullMetricsQuery = useQuery({
+    queryKey: ['city-full-metrics', effectiveCity],
+    queryFn: async () => {
+      const response = await analyse({
+        mode: 'city',
+        city: effectiveCity,
+        run_async: false,
+      })
+      if (isJobResponse(response)) {
+        throw new Error('Expected synchronous city analysis response')
+      }
+      return response
+    },
+    enabled: Boolean(effectiveCity),
+  })
+
   const metaMetricsQuery = useQuery({
     queryKey: ['meta-metrics'],
     queryFn: getMetaMetrics,
   })
 
   const mapMetricOptions = useMemo(() => {
-    const allMetrics = metaMetricsQuery.data?.metrics ?? []
+    const allMetrics = (metaMetricsQuery.data?.metrics ?? []).filter((metric) => !RETIRED_METRIC_IDS.has(metric.metric_id))
     const preferred = allMetrics.filter((metric) => MAP_METRIC_IDS.includes(metric.metric_id))
     return preferred.length > 0 ? preferred : allMetrics
   }, [metaMetricsQuery.data?.metrics])
@@ -561,6 +578,39 @@ function App() {
     },
   })
 
+  const analyseJobQuery = useQuery({
+    queryKey: ['analyse-job', activeJobId],
+    queryFn: () => getAnalyseJob(activeJobId),
+    enabled: Boolean(activeJobId),
+    refetchInterval: (query) => {
+      const current = query.state.data as AnalyseJobResponse | undefined
+      if (!current) {
+        return 1500
+      }
+      if (current.status === 'queued') {
+        return 1500
+      }
+      if (current.status === 'running') {
+        const startedIso = current.started_at ?? current.created_at
+        const startedMs = startedIso ? new Date(startedIso).getTime() : Number.NaN
+        if (Number.isFinite(startedMs)) {
+          const elapsedMs = Date.now() - startedMs
+          if (elapsedMs < 20_000) {
+            return 1000
+          }
+          if (elapsedMs < 90_000) {
+            return 2000
+          }
+        }
+        return 3000
+      }
+      return false
+    },
+  })
+
+  const activeJob = analyseJobQuery.data
+  const activeJobInProgress = activeJob?.status === 'queued' || activeJob?.status === 'running'
+
   const drawnAnalysisKey = useMemo(() => {
     if (!effectiveCity || !geometryValidation.normalizedGeometry || !geometryValidation.isValid) {
       return ''
@@ -576,20 +626,44 @@ function App() {
   }, [effectiveCity, selectedWardGeometry, selectedWardIds])
 
   useEffect(() => {
-    if (!drawnAnalysisKey || !geometryValidation.normalizedGeometry) {
+    const normalizedGeometry = geometryValidation.normalizedGeometry
+    if (!drawnAnalysisKey || !normalizedGeometry) {
       return
     }
     if (lastSubmittedAnalysisKeyRef.current === drawnAnalysisKey) {
       return
     }
-    lastSubmittedAnalysisKeyRef.current = drawnAnalysisKey
-    submitAreaAnalysisMutation.mutate({
-      geometry: geometryValidation.normalizedGeometry,
-      source: 'drawn_polygon',
-      key: drawnAnalysisKey,
-      label: 'Drawn area of interest',
-    })
-  }, [drawnAnalysisKey, geometryValidation.normalizedGeometry, submitAreaAnalysisMutation])
+    if (submitAreaAnalysisMutation.isPending) {
+      return
+    }
+    if (activeJobInProgress && activeAnalysisSource === 'drawn_polygon') {
+      return
+    }
+
+    const timer = window.setTimeout(() => {
+      if (lastSubmittedAnalysisKeyRef.current === drawnAnalysisKey) {
+        return
+      }
+      lastSubmittedAnalysisKeyRef.current = drawnAnalysisKey
+      submitAreaAnalysisMutation.mutate({
+        geometry: normalizedGeometry,
+        source: 'drawn_polygon',
+        key: drawnAnalysisKey,
+        label: 'Drawn area of interest',
+      })
+    }, 600)
+
+    return () => {
+      window.clearTimeout(timer)
+    }
+  }, [
+    activeAnalysisSource,
+    activeJobInProgress,
+    drawnAnalysisKey,
+    geometryValidation.normalizedGeometry,
+    submitAreaAnalysisMutation,
+    submitAreaAnalysisMutation.isPending,
+  ])
 
   useEffect(() => {
     if (!selectedWardsAnalysisKey || !selectedWardGeometry || selectedWardIds.length <= 1) {
@@ -598,14 +672,38 @@ function App() {
     if (lastSubmittedAnalysisKeyRef.current === selectedWardsAnalysisKey) {
       return
     }
-    lastSubmittedAnalysisKeyRef.current = selectedWardsAnalysisKey
-    submitAreaAnalysisMutation.mutate({
-      geometry: selectedWardGeometry,
-      source: 'selected_wards',
-      key: selectedWardsAnalysisKey,
-      label: `${selectedWardIds.length} wards combined`,
-    })
-  }, [selectedWardGeometry, selectedWardIds.length, selectedWardsAnalysisKey, submitAreaAnalysisMutation])
+    if (submitAreaAnalysisMutation.isPending) {
+      return
+    }
+    if (activeJobInProgress && activeAnalysisSource === 'selected_wards') {
+      return
+    }
+
+    const timer = window.setTimeout(() => {
+      if (lastSubmittedAnalysisKeyRef.current === selectedWardsAnalysisKey) {
+        return
+      }
+      lastSubmittedAnalysisKeyRef.current = selectedWardsAnalysisKey
+      submitAreaAnalysisMutation.mutate({
+        geometry: selectedWardGeometry,
+        source: 'selected_wards',
+        key: selectedWardsAnalysisKey,
+        label: `${selectedWardIds.length} wards combined`,
+      })
+    }, 600)
+
+    return () => {
+      window.clearTimeout(timer)
+    }
+  }, [
+    activeAnalysisSource,
+    activeJobInProgress,
+    selectedWardGeometry,
+    selectedWardIds.length,
+    selectedWardsAnalysisKey,
+    submitAreaAnalysisMutation,
+    submitAreaAnalysisMutation.isPending,
+  ])
 
   useEffect(() => {
     if (currentAoiSource !== 'selected_wards') {
@@ -615,21 +713,6 @@ function App() {
       clearAnalysisSource('drawn_polygon')
     }
   }, [clearAnalysisSource, currentAoiSource])
-
-  const analyseJobQuery = useQuery({
-    queryKey: ['analyse-job', activeJobId],
-    queryFn: () => getAnalyseJob(activeJobId),
-    enabled: Boolean(activeJobId),
-    refetchInterval: (query) => {
-      const current = query.state.data as AnalyseJobResponse | undefined
-      if (!current) {
-        return 1000
-      }
-      return current.status === 'queued' || current.status === 'running' ? 1000 : false
-    },
-  })
-
-  const activeJob = analyseJobQuery.data
 
   useEffect(() => {
     if (activeJob?.status !== 'queued' && activeJob?.status !== 'running') {
@@ -736,7 +819,30 @@ function App() {
     }
   }, [currentAoiDescription.subtitle, currentAoiDescription.title, effectiveSelectedWardId, wardDetailsQuery.data])
 
+  const cityPanelData = useMemo<PanelSnapshot | null>(() => {
+    const result = cityFullMetricsQuery.data?.result as {
+      metrics_json?: { all_metrics?: Record<string, unknown> }
+      quality_summary?: Record<string, unknown>
+    } | undefined
+
+    if (!result?.metrics_json?.all_metrics) {
+      return null
+    }
+
+    return {
+      sourceType: 'city',
+      sourceId: effectiveCity || 'city',
+      title: `${effectiveCity || 'City'} full extent`,
+      subtitle: 'City-wide aggregate of the latest ward metrics.',
+      metrics: result.metrics_json.all_metrics,
+      qualitySummary: result.quality_summary ?? {},
+    }
+  }, [cityFullMetricsQuery.data?.result, effectiveCity])
+
   const activePanelData = useMemo<PanelSnapshot | null>(() => {
+    if (currentAoiSource === 'city') {
+      return cityPanelData
+    }
     if (currentAoiSource === 'ward') {
       return wardPanelData
     }
@@ -747,7 +853,7 @@ function App() {
       return activeCustomPanelData
     }
     return null
-  }, [activeAnalysisSource, activeCustomPanelData, currentAoiSource, wardPanelData])
+  }, [activeAnalysisSource, activeCustomPanelData, cityPanelData, currentAoiSource, wardPanelData])
 
   const cityAverageMetricMap = useMemo(() => {
     const map = new Map<string, number>()
@@ -808,11 +914,15 @@ function App() {
       return
     }
 
+    const exportSourceType =
+      activePanelData.sourceType === 'selected_wards' || activePanelData.sourceType === 'drawn_polygon'
+        ? 'custom_polygon'
+        : activePanelData.sourceType
     const fileName = `urbanmor_${effectiveCity}_${activePanelData.sourceType}_${activePanelData.sourceId}.json`
     const payload = makeMetricsExportJson(
       {
         city: effectiveCity,
-        sourceType: activePanelData.sourceType === 'selected_wards' ? 'custom_polygon' : (activePanelData.sourceType as 'ward' | 'custom_polygon'),
+        sourceType: exportSourceType,
         sourceId: activePanelData.sourceId,
         qualitySummary: activePanelData.qualitySummary,
       },
@@ -828,11 +938,15 @@ function App() {
       return
     }
 
+    const exportSourceType =
+      activePanelData.sourceType === 'selected_wards' || activePanelData.sourceType === 'drawn_polygon'
+        ? 'custom_polygon'
+        : activePanelData.sourceType
     const fileName = `urbanmor_${effectiveCity}_${activePanelData.sourceType}_${activePanelData.sourceId}.csv`
     const payload = makeMetricsExportCsv(
       {
         city: effectiveCity,
-        sourceType: activePanelData.sourceType === 'selected_wards' ? 'custom_polygon' : (activePanelData.sourceType as 'ward' | 'custom_polygon'),
+        sourceType: exportSourceType,
         sourceId: activePanelData.sourceId,
         qualitySummary: activePanelData.qualitySummary,
       },
@@ -1211,7 +1325,11 @@ function App() {
   const wardError = wardsQuery.error instanceof Error ? wardsQuery.error.message : ''
   const metricError = cityWardsMetricsQuery.error instanceof Error ? cityWardsMetricsQuery.error.message : ''
   const cityAverageError = cityMetricsQuery.error instanceof Error ? cityMetricsQuery.error.message : ''
-  const fullMetricError = wardDetailsQuery.error instanceof Error ? wardDetailsQuery.error.message : ''
+  const fullMetricError = wardDetailsQuery.error instanceof Error
+    ? wardDetailsQuery.error.message
+    : cityFullMetricsQuery.error instanceof Error
+      ? cityFullMetricsQuery.error.message
+      : ''
   const roadLayerError = roadLayerQuery.error instanceof Error ? roadLayerQuery.error.message : ''
   const transitLayerError = transitLayerQuery.error instanceof Error ? transitLayerQuery.error.message : ''
 
@@ -1369,12 +1487,12 @@ function App() {
               Drill Down: full metrics and downloads
             </summary>
             <p className="mt-2 text-[11px] text-slate-500">
-              Keep the first screen lightweight. Open this only when you need the full metric stack or exports.
+              Keep the first screen lightweight. City-wide full metrics are available here by default; AOI selections replace them.
             </p>
 
             {!activePanelData ? (
               <p className="mt-4 rounded-2xl border border-stone-200 bg-stone-50 p-3 text-sm text-slate-600">
-                Select wards or draw a polygon to unlock exhaustive AOI metrics and downloads.
+                Loading full city metrics. You can still select wards or draw a polygon for a custom AOI.
               </p>
             ) : (
               <>

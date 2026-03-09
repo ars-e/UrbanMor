@@ -76,7 +76,6 @@ The road-family metrics use a shared graph derivation:
 | `bldg.footprint_regularity` | Mean isoperimetric quotient `(4πA / P^2) * 100` | index | Computed on clipped footprint polygons. |
 | `bldg.edge_coverage` | Share of roughly 20 m road samples within 15 m of nearby building footprints | percent | Proxy only. This approximates active/fronted road edge coverage without parcel frontage lines. |
 | `bldg.far_proxy` | `sum(area_weighted_floor_area_proxy_m2) / polygon_area_m2` | ratio proxy | If building levels exist, floor-area proxy is scaled by clipped footprint share; otherwise clipped footprint area is used as a one-storey fallback. |
-| `bldg.growth_rate` | `NULL` | n/a | Blocked until temporal building snapshots are ingested. |
 
 ## Land Use and Open Space Metrics
 
@@ -108,8 +107,7 @@ The road-family metrics use a shared graph derivation:
 | `topo.mean_slope` | Mean slope-raster value over clipped valid pixels | degrees | Raster summary stat. |
 | `topo.steep_area_pct` | Share of slope pixels with value `> 15` | percent | Threshold is fixed at 15 degrees. |
 | `topo.flat_area_pct` | Share of slope pixels with value `< 3` | percent | Threshold is fixed at 3 degrees. |
-| `topo.flood_risk_proxy` | Share of binary flood-risk proxy raster pixels equal to `1` | percent proxy | Depends on the derived `dem.<city>_flood_risk_proxy` layer. |
-| `topo.natural_constraint_index` | `clamp(0.5 * steep_area_pct + 0.3 * flood_risk_proxy + 0.2 * water_body_pct)` | index | Proxy only. Weights are heuristic and factors overlap. |
+| `topo.natural_constraint_index` | `clamp(0.7 * steep_area_pct + 0.3 * water_body_pct)` | index | Proxy only. Weights are heuristic and factors overlap. |
 
 ## Composite Metrics
 
@@ -124,7 +122,7 @@ The road-family metrics use a shared graph derivation:
 | `cmp.informality_index` | `0.35*density_norm + 0.25*(100-cnr) + 0.20*(100-green_cover) + 0.20*vacant_pct` | index | `density_norm = clamp(building_density_per_ha / 250 * 100)`. |
 | `cmp.heat_island_proxy` | `0.35*impervious + 0.25*bcr + 0.25*(100-green_cover) + 0.15*flat_area` | index proxy | Proxy only; no temperature observation is used. |
 | `cmp.development_pressure` | `0.40*vacant_pct + 0.35*density_norm + 0.25*edge_norm` | index | `density_norm = clamp(building_density_per_ha / 250 * 100)`; `edge_norm = clamp(edge_density / 30 * 100)`. |
-| `cmp.topographic_constraint_expansion` | `0.50*natural_constraint + 0.30*steep_pct + 0.20*flood_risk` | index | Emphasizes terrain and hydrologic constraint. |
+| `cmp.topographic_constraint_expansion` | `0.625*natural_constraint + 0.375*steep_pct` | index | Flood-risk proxy removed; weights renormalized from the previous formulation. |
 | `cmp.green_accessibility` | `0.40*park_distance_score + 0.30*park_density_norm + 0.30*green_cover` | index | `park_distance_score = 100 / (1 + distance_m / 300)`; `park_density_norm = clamp(park_density_ha_sqkm / 80 * 100)`. |
 | `cmp.transit_access_green` | `0.55*transit_coverage + 0.45*green_accessibility` | index | Combines proximity to transit and access to green space. |
 | `cmp.compactness` | `0.30*bcr + 0.25*intersection_norm + 0.25*mix_norm + 0.20*circuity_score` | index | `mix_norm = clamp(mix_index / 3 * 100)`; `circuity_score = 100` when `circuity <= 1`, else `100 / (1 + ((circuity - 1) * 5))`. |
@@ -136,9 +134,7 @@ The road-family metrics use a shared graph derivation:
 | `road.circuity` | Proxy only | Uses segment sinuosity because OD routing circuity is not available without a routing solver in-database. |
 | `bldg.edge_coverage` | Proxy only | Uses road samples and building proximity because parcel/frontage lines are not available. |
 | `bldg.far_proxy` | Proxy only | Depends on inferred or tagged building levels and falls back to footprint area when levels are missing. |
-| `topo.flood_risk_proxy` | Proxy only | Depends on a derived binary flood-risk raster rather than observed flood events. |
 | `cmp.heat_island_proxy` | Proxy only | Composite proxy; no thermal imagery or station observations are used. |
-| `bldg.growth_rate` | Blocked | Temporal building snapshots are not yet ingested. |
 
 ## File Map
 - Core helpers: `sql/000_metric_helpers.sql`

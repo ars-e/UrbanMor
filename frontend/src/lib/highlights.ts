@@ -20,12 +20,12 @@ interface HighlightDefinition {
 export const MAP_METRIC_IDS = [
   'road.intersection_density',
   'road.cnr',
+  'road.pedestrian_infra_ratio',
   'transit.coverage_500m',
   'bldg.bcr',
   'lulc.green_cover_pct',
   'open.distance_to_nearest_park',
   'cmp.walkability_index',
-  'topo.flood_risk_proxy',
 ]
 
 const HIGHLIGHT_DEFINITIONS: HighlightDefinition[] = [

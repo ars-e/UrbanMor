@@ -9,14 +9,30 @@ if [[ ! -f "$TUNNEL_LOG" ]]; then
   exit 1
 fi
 
-TUNNEL_URL="$(rg -o 'https://[a-z0-9-]+\.trycloudflare\.com' -N "$TUNNEL_LOG" | tail -n 1)"
-if [[ -z "$TUNNEL_URL" ]]; then
+TUNNEL_CANDIDATES=()
+while IFS= read -r candidate; do
+  TUNNEL_CANDIDATES+=("$candidate")
+done < <(rg -o 'https://[a-z0-9-]+\.trycloudflare\.com' -N "$TUNNEL_LOG" | awk '!seen[$0]++')
+if [[ ${#TUNNEL_CANDIDATES[@]} -eq 0 ]]; then
   echo "Could not detect tunnel URL from log: $TUNNEL_LOG" >&2
   exit 1
 fi
 
-if ! curl -fsS "$TUNNEL_URL/health" >/dev/null; then
-  echo "Tunnel URL is not healthy: $TUNNEL_URL" >&2
+TUNNEL_URL=""
+for (( idx=${#TUNNEL_CANDIDATES[@]}-1; idx>=0; idx-- )); do
+  candidate="${TUNNEL_CANDIDATES[$idx]}"
+  if curl -fsS -m 8 "$candidate/health" >/dev/null; then
+    TUNNEL_URL="$candidate"
+    break
+  fi
+done
+
+if [[ -z "$TUNNEL_URL" ]]; then
+  echo "No healthy tunnel URL found in $TUNNEL_LOG" >&2
+  printf 'Checked URLs (newest first):\n' >&2
+  for (( idx=${#TUNNEL_CANDIDATES[@]}-1; idx>=0; idx-- )); do
+    printf '  %s\n' "${TUNNEL_CANDIDATES[$idx]}" >&2
+  done
   exit 1
 fi
 

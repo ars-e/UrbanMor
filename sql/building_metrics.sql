@@ -946,8 +946,6 @@ AS $$
     'bldg.orientation', metrics.compute_bldg_orientation(p_city, p_geom),
     'bldg.footprint_regularity', metrics.compute_bldg_footprint_regularity(p_city, p_geom),
     'bldg.edge_coverage', metrics.compute_bldg_edge_coverage(p_city, p_geom),
-    'bldg.far_proxy', metrics.compute_bldg_far_proxy(p_city, p_geom),
-    -- Explicitly returned as NULL until temporal snapshots are ingested.
-    'bldg.growth_rate', metrics.compute_bldg_growth_rate(p_city, p_geom)
+    'bldg.far_proxy', metrics.compute_bldg_far_proxy(p_city, p_geom)
   );
 $$;

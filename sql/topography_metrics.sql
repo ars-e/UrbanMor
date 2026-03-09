@@ -438,15 +438,14 @@ RETURNS double precision
 LANGUAGE plpgsql
 STABLE
 AS $$
--- Weights: steep_slope(0.5) + flood_proxy(0.3) + water_body(0.2).
+-- Weights: steep_slope(0.7) + water_body(0.3).
 -- These are proxy weights and are not scientifically calibrated.
--- Factors may overlap (e.g. steep riverbanks counted in both steep and water components).
+-- Factors may overlap (e.g. steep riverbanks counted in both components).
 -- Treat as indicative ordering only.
 DECLARE
   v_city text;
   v_geom_4326 geometry(MultiPolygon, 4326);
   v_steep double precision;
-  v_flood double precision;
   v_water_pct double precision := 0.0;
   v_water_m2 double precision := 0.0;
   v_sql text;
@@ -458,7 +457,6 @@ BEGIN
   IF ST_Area(v_geom_4326::geography) <= 0 THEN RETURN NULL; END IF;
 
   v_steep := COALESCE(metrics.compute_topo_steep_area_pct(v_city, v_geom_4326), 0.0);
-  v_flood := COALESCE(metrics.compute_topo_flood_risk_proxy(v_city, v_geom_4326), 0.0);
 
   IF to_regclass(format('%I.%I', 'green', v_city || '_water_bodies_canonical')) IS NOT NULL THEN
     v_sql := format($SQL$
@@ -479,7 +477,7 @@ BEGIN
   END IF;
 
   -- Weighted 0-100 index of natural constraints.
-  RETURN LEAST(100.0, GREATEST(0.0, (0.5 * v_steep) + (0.3 * v_flood) + (0.2 * v_water_pct)));
+  RETURN LEAST(100.0, GREATEST(0.0, (0.7 * v_steep) + (0.3 * v_water_pct)));
 END;
 $$;
 
@@ -501,7 +499,6 @@ AS $$
     'topo.mean_slope', metrics.compute_topo_mean_slope(p_city, p_geom),
     'topo.steep_area_pct', metrics.compute_topo_steep_area_pct(p_city, p_geom),
     'topo.flat_area_pct', metrics.compute_topo_flat_area_pct(p_city, p_geom),
-    'topo.flood_risk_proxy', metrics.compute_topo_flood_risk_proxy(p_city, p_geom),
     'topo.natural_constraint_index', metrics.compute_topo_natural_constraint_index(p_city, p_geom)
   );
 $$;

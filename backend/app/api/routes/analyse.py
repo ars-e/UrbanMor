@@ -19,7 +19,7 @@ async def analyse(
     response: Response,
     service: Annotated[AnalyseService, Depends(get_analyse_service)],
 ) -> AnalyseResponse | AnalyseJobResponse:
-    if payload.mode == "custom_polygon" and payload.run_async is True:
+    if payload.mode == "custom_polygon" and payload.run_async is not False:
         job = await service.enqueue_custom_polygon_job(payload)
         service.spawn_job(job.job_id)
         response.status_code = status.HTTP_202_ACCEPTED

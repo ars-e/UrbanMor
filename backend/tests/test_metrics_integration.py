@@ -25,6 +25,10 @@ def test_metric_endpoints_integration(client) -> None:
     assert ward_payload["city"] == city
     assert ward_payload["ward_id"] == ward_id
     assert "all_metrics" in ward_payload["metrics_json"]
+    all_metrics = ward_payload["metrics_json"]["all_metrics"]
+    assert "cmp.walkability_index" in all_metrics
+    assert "bldg.growth_rate" not in all_metrics
+    assert "topo.flood_risk_proxy" not in all_metrics
 
     city_metrics_resp = client.get(f"/cities/{city}/metrics")
     assert city_metrics_resp.status_code == 200
@@ -49,3 +53,10 @@ def test_analyse_city_and_ward_paths(client) -> None:
     )
     assert city_analyse.status_code == 200
     assert city_analyse.json()["mode"] == "city"
+    result = city_analyse.json()["result"]
+    assert "metrics_json" in result
+    assert "all_metrics" in result["metrics_json"]
+    city_all_metrics = result["metrics_json"]["all_metrics"]
+    assert "cmp.walkability_index" in city_all_metrics
+    assert "bldg.growth_rate" not in city_all_metrics
+    assert "topo.flood_risk_proxy" not in city_all_metrics

@@ -41,10 +41,12 @@ export interface SideBySideRow {
 
 interface ExportContext {
   city: string
-  sourceType: 'ward' | 'custom_polygon'
+  sourceType: 'ward' | 'custom_polygon' | 'city'
   sourceId: string
   qualitySummary?: Record<string, unknown>
 }
+
+const RETIRED_METRIC_IDS = new Set(['bldg.growth_rate', 'topo.flood_risk_proxy'])
 
 function toFamily(metricId: string, meta?: MetricMetaItem): string {
   if (meta?.frontend_group) {
@@ -123,6 +125,7 @@ export function buildMetricPanelRows(
   const metaById = new Map(metadata.map((meta) => [meta.metric_id, meta]))
 
   return Object.entries(metricsPayload)
+    .filter(([metricId]) => !RETIRED_METRIC_IDS.has(metricId))
     .map(([metricId, value]) => {
       const meta = metaById.get(metricId)
       const family = toFamily(metricId, meta)

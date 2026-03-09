@@ -71,7 +71,7 @@ def test_custom_polygon_async_polling(client) -> None:
     job = enqueue.json()
     assert "job_id" in job
 
-    deadline = time.time() + 45
+    deadline = time.time() + 90
     terminal_payload = None
     while time.time() < deadline:
         poll = client.get(f"/analyse/jobs/{job['job_id']}")

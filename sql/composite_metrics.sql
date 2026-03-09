@@ -186,22 +186,19 @@ AS $$
 DECLARE
   v_natural_constraint double precision;
   v_steep_pct double precision;
-  v_flood_risk double precision;
 BEGIN
   v_natural_constraint := metrics.compute_topo_natural_constraint_index(p_city, p_geom);
   v_steep_pct := metrics.compute_topo_steep_area_pct(p_city, p_geom);
-  v_flood_risk := metrics.compute_topo_flood_risk_proxy(p_city, p_geom);
 
   IF v_natural_constraint IS NULL
-     AND v_steep_pct IS NULL
-     AND v_flood_risk IS NULL THEN
+     AND v_steep_pct IS NULL THEN
     RETURN NULL;
   END IF;
 
+  -- Flood-risk proxy is retired; weights are renormalized from 0.5/0.3.
   RETURN metrics._clamp_0_100(
-    (0.50 * COALESCE(v_natural_constraint, 0.0)) +
-    (0.30 * COALESCE(v_steep_pct, 0.0)) +
-    (0.20 * COALESCE(v_flood_risk, 0.0))
+    (0.625 * COALESCE(v_natural_constraint, 0.0)) +
+    (0.375 * COALESCE(v_steep_pct, 0.0))
   );
 END;
 $$;
