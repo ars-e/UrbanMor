@@ -167,13 +167,25 @@ class AnalyseService:
             return 100.0
         return value
 
+    @staticmethod
+    def _weighted_score(components: list[tuple[float | None, float]]) -> float | None:
+        """Weighted average over available (non-None) inputs, renormalizing weights to sum to 1.
+
+        Missing inputs are excluded rather than zero-filled, so scores reflect
+        performance on the metrics we can actually measure.
+        """
+        available = [(score, weight) for score, weight in components if score is not None]
+        if not available:
+            return None
+        total_weight = sum(w for _, w in available)
+        if total_weight <= 0.0:
+            return None
+        return sum(score * weight for score, weight in available) / total_weight
+
     @classmethod
     def _compute_composite_metrics(cls, metrics: dict[str, Any]) -> dict[str, float | None]:
         def m(metric_id: str) -> float | None:
             return cls._metric_number(metrics.get(metric_id))
-
-        def all_missing(*values: float | None) -> bool:
-            return all(value is None for value in values)
 
         road_intersection_density = m("road.intersection_density")
         road_cnr = m("road.cnr")
@@ -181,109 +193,92 @@ class AnalyseService:
         transit_coverage = m("transit.coverage_500m")
         transit_distance_m = m("transit.distance_to_metro_or_rail")
 
-        if all_missing(road_intersection_density, road_cnr, road_ped_ratio, transit_coverage, transit_distance_m):
-            walkability = None
-        else:
-            intersection_norm = cls._clamp_0_100(((road_intersection_density or 0.0) / 120.0) * 100.0) or 0.0
-            transit_distance_score = 0.0 if transit_distance_m is None else 100.0 / (1.0 + (transit_distance_m / 500.0))
-            walkability = cls._clamp_0_100(
-                (0.25 * intersection_norm)
-                + (0.25 * (road_cnr or 0.0))
-                + (0.20 * (road_ped_ratio or 0.0))
-                + (0.20 * (transit_coverage or 0.0))
-                + (0.10 * transit_distance_score)
-            )
+        intersection_norm = cls._clamp_0_100(((road_intersection_density / 120.0) * 100.0)) if road_intersection_density is not None else None
+        transit_distance_score = (
+            None if transit_distance_m is None
+            else cls._clamp_0_100(100.0 / (1.0 + (max(0.0, transit_distance_m) / 500.0)))
+        )
+        walkability = cls._clamp_0_100(cls._weighted_score([
+            (intersection_norm, 0.25),
+            (road_cnr, 0.25),
+            (road_ped_ratio, 0.20),
+            (transit_coverage, 0.20),
+            (transit_distance_score, 0.10),
+        ]))
 
         bldg_density = m("bldg.density_per_ha")
         green_cover = m("lulc.green_cover_pct")
         vacant_pct = m("open.vacant_land_pct")
-        if all_missing(bldg_density, road_cnr, green_cover, vacant_pct):
-            informality = None
-        else:
-            density_norm = cls._clamp_0_100(((bldg_density or 0.0) / 250.0) * 100.0) or 0.0
-            informality = cls._clamp_0_100(
-                (0.35 * density_norm)
-                + (0.25 * (100.0 - (road_cnr or 0.0)))
-                + (0.20 * (100.0 - (green_cover or 0.0)))
-                + (0.20 * (vacant_pct or 0.0))
-            )
+        density_norm = cls._clamp_0_100(((bldg_density / 250.0) * 100.0)) if bldg_density is not None else None
+        connectivity_score = (100.0 - road_cnr) if road_cnr is not None else None
+        greenness_inv = (100.0 - green_cover) if green_cover is not None else None
+        informality = cls._clamp_0_100(cls._weighted_score([
+            (density_norm, 0.35),
+            (connectivity_score, 0.25),
+            (greenness_inv, 0.20),
+            (vacant_pct, 0.20),
+        ]))
 
         impervious = m("lulc.impervious_ratio")
         bcr = m("bldg.bcr")
         flat_area = m("topo.flat_area_pct")
-        if all_missing(impervious, bcr, green_cover, flat_area):
-            heat_island = None
-        else:
-            heat_island = cls._clamp_0_100(
-                (0.35 * (impervious or 0.0))
-                + (0.25 * (bcr or 0.0))
-                + (0.25 * (100.0 - (green_cover or 0.0)))
-                + (0.15 * (flat_area or 0.0))
-            )
+        heat_island = cls._clamp_0_100(cls._weighted_score([
+            (impervious, 0.35),
+            (bcr, 0.25),
+            (greenness_inv, 0.25),
+            (flat_area, 0.15),
+        ]))
 
         road_edge_density = m("road.edge_density")
-        if all_missing(vacant_pct, bldg_density, road_edge_density):
-            development_pressure = None
-        else:
-            density_norm = cls._clamp_0_100(((bldg_density or 0.0) / 250.0) * 100.0) or 0.0
-            edge_norm = cls._clamp_0_100(((road_edge_density or 0.0) / 30.0) * 100.0) or 0.0
-            development_pressure = cls._clamp_0_100(
-                (0.40 * (vacant_pct or 0.0))
-                + (0.35 * density_norm)
-                + (0.25 * edge_norm)
-            )
+        edge_norm = cls._clamp_0_100(((road_edge_density / 30.0) * 100.0)) if road_edge_density is not None else None
+        development_pressure = cls._clamp_0_100(cls._weighted_score([
+            (vacant_pct, 0.40),
+            (density_norm, 0.35),
+            (edge_norm, 0.25),
+        ]))
 
         topo_natural_constraint = m("topo.natural_constraint_index")
         topo_steep_pct = m("topo.steep_area_pct")
-        if all_missing(topo_natural_constraint, topo_steep_pct):
-            topographic_constraint = None
-        else:
-            # Flood-risk proxy was retired; weights are renormalized from 0.5/0.3.
-            topographic_constraint = cls._clamp_0_100(
-                (0.625 * (topo_natural_constraint or 0.0))
-                + (0.375 * (topo_steep_pct or 0.0))
-            )
+        # Flood-risk proxy was retired; weights below are renormalized from 0.5/0.3.
+        topographic_constraint = cls._clamp_0_100(cls._weighted_score([
+            (topo_natural_constraint, 0.625),
+            (topo_steep_pct, 0.375),
+        ]))
 
         distance_to_park_m = m("open.distance_to_nearest_park")
         park_density = m("open.park_green_space_density")
-        if all_missing(distance_to_park_m, park_density, green_cover):
-            green_accessibility = None
-        else:
-            distance_score = 0.0 if distance_to_park_m is None else 100.0 / (1.0 + (distance_to_park_m / 300.0))
-            park_density_norm = cls._clamp_0_100(((park_density or 0.0) / 80.0) * 100.0) or 0.0
-            green_accessibility = cls._clamp_0_100(
-                (0.40 * distance_score)
-                + (0.30 * park_density_norm)
-                + (0.30 * (green_cover or 0.0))
-            )
+        distance_score = (
+            None if distance_to_park_m is None
+            else cls._clamp_0_100(100.0 / (1.0 + (max(0.0, distance_to_park_m) / 300.0)))
+        )
+        park_density_norm = cls._clamp_0_100(((park_density / 80.0) * 100.0)) if park_density is not None else None
+        green_accessibility = cls._clamp_0_100(cls._weighted_score([
+            (distance_score, 0.40),
+            (park_density_norm, 0.30),
+            (green_cover, 0.30),
+        ]))
 
-        if all_missing(transit_coverage, green_accessibility):
-            transit_access_green = None
-        else:
-            transit_access_green = cls._clamp_0_100(
-                (0.55 * (transit_coverage or 0.0))
-                + (0.45 * (green_accessibility or 0.0))
-            )
+        transit_access_green = cls._clamp_0_100(cls._weighted_score([
+            (transit_coverage, 0.55),
+            (green_accessibility, 0.45),
+        ]))
 
         lulc_mix_index = m("lulc.mix_index")
         road_circuity = m("road.circuity")
-        if all_missing(bcr, road_intersection_density, lulc_mix_index, road_circuity):
-            compactness = None
+        intersection_norm_cmp = cls._clamp_0_100(((road_intersection_density / 120.0) * 100.0)) if road_intersection_density is not None else None
+        mix_norm = cls._clamp_0_100(((lulc_mix_index / 3.0) * 100.0)) if lulc_mix_index is not None else None
+        if road_circuity is None:
+            circuity_score = None
+        elif road_circuity <= 1.0:
+            circuity_score = 100.0
         else:
-            intersection_norm = cls._clamp_0_100(((road_intersection_density or 0.0) / 120.0) * 100.0) or 0.0
-            mix_norm = cls._clamp_0_100(((lulc_mix_index or 0.0) / 3.0) * 100.0) or 0.0
-            if road_circuity is None:
-                circuity_score = 0.0
-            elif road_circuity <= 1.0:
-                circuity_score = 100.0
-            else:
-                circuity_score = 100.0 / (1.0 + ((road_circuity - 1.0) * 5.0))
-            compactness = cls._clamp_0_100(
-                (0.30 * (bcr or 0.0))
-                + (0.25 * intersection_norm)
-                + (0.25 * mix_norm)
-                + (0.20 * circuity_score)
-            )
+            circuity_score = 100.0 / (1.0 + ((road_circuity - 1.0) * 5.0))
+        compactness = cls._clamp_0_100(cls._weighted_score([
+            (bcr, 0.30),
+            (intersection_norm_cmp, 0.25),
+            (mix_norm, 0.25),
+            (circuity_score, 0.20),
+        ]))
 
         return {
             "cmp.walkability_index": walkability,

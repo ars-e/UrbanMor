@@ -6,6 +6,7 @@ import type { FeatureCollection, Geometry, MultiPolygon, Polygon } from 'geojson
 import type { MapGeoJSONFeature } from 'maplibre-gl'
 
 import {
+  API_BASE,
   analyse,
   getAnalyseJob,
   getCities,
@@ -588,13 +589,19 @@ function App() {
         return 1500
       }
       if (current.status === 'queued') {
+        const createdMs = current.created_at ? new Date(current.created_at).getTime() : Number.NaN
+        if (Number.isFinite(createdMs) && Date.now() - createdMs > 12 * 60_000) {
+          return false
+        }
         return 1500
       }
       if (current.status === 'running') {
-        const startedIso = current.started_at ?? current.created_at
-        const startedMs = startedIso ? new Date(startedIso).getTime() : Number.NaN
+        const startedMs = current.started_at ? new Date(current.started_at).getTime() : Number.NaN
         if (Number.isFinite(startedMs)) {
           const elapsedMs = Date.now() - startedMs
+          if (elapsedMs > 12 * 60_000) {
+            return false
+          }
           if (elapsedMs < 20_000) {
             return 1000
           }
@@ -749,6 +756,9 @@ function App() {
       return 'Queued for AOI analysis.'
     }
     if (activeJob.status === 'running') {
+      if (activeJobElapsedSeconds > 12 * 60) {
+        return 'Analysis timed out. Try a smaller area or reset the AOI.'
+      }
       if (activeJobElapsedSeconds < 20) {
         return 'Normalizing geometry and loading metrics.'
       }
@@ -1325,6 +1335,7 @@ function App() {
   const wardError = wardsQuery.error instanceof Error ? wardsQuery.error.message : ''
   const metricError = cityWardsMetricsQuery.error instanceof Error ? cityWardsMetricsQuery.error.message : ''
   const cityAverageError = cityMetricsQuery.error instanceof Error ? cityMetricsQuery.error.message : ''
+  const noCitiesReturned = !citiesQuery.isLoading && !cityError && (citiesQuery.data?.cities?.length ?? 0) === 0
   const fullMetricError = wardDetailsQuery.error instanceof Error
     ? wardDetailsQuery.error.message
     : cityFullMetricsQuery.error instanceof Error
@@ -1365,6 +1376,12 @@ function App() {
             <p className="mt-2 text-[11px] text-slate-500">
               Start with one ward, add more wards, or switch to a fully custom polygon.
             </p>
+            {noCitiesReturned ? (
+              <p className="mt-3 rounded-2xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
+                No cities were returned by <span className="font-semibold">{API_BASE}/cities</span>. Check that the backend is running and the database has
+                boundary ward tables loaded.
+              </p>
+            ) : null}
           </section>
 
           <section className="mt-4 rounded-[24px] border border-stone-200 bg-white/95 p-4 shadow-sm">
