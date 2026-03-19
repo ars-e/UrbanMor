@@ -21,6 +21,7 @@ import {
 import { buildHighlightCards, MAP_METRIC_IDS } from './lib/highlights'
 import { validateAndNormalizeGeometry } from './lib/geometry'
 import { areaSqKm, buildSelectedWardAoiGeometry, createBasemapStyle, formatAreaSqKm, serializeViewportBbox, type MapViewport } from './lib/map'
+import { createCirclePolygon, getCircleColor, getCircleLabel } from './lib/circle'
 import {
   buildMetricPanelRows,
   downloadTextFile,
@@ -32,7 +33,9 @@ import {
 import type {
   AnalyseJobResponse,
   AnalyseResponse,
+  CircleMetricsData,
   CityMapLayerGeoJSONResponse,
+  LockedCircle,
   MetricMetaItem,
   WardGeometryFeature,
   WardMetricResponse,
@@ -286,6 +289,15 @@ function App() {
   const [showTransitOverlay, setShowTransitOverlay] = useState<boolean>(true)
   const [mapViewport, setMapViewport] = useState<MapViewport | null>(null)
 
+  // Circle tool state
+  const [circleToolActive, setCircleToolActive] = useState<boolean>(true) // Default enabled
+  const [circleRadius, setCircleRadius] = useState<number>(250) // Start with smaller 250m radius
+  const [lockedCircles, setLockedCircles] = useState<LockedCircle[]>([])
+  const [circleMetrics, setCircleMetrics] = useState<Map<string, CircleMetricsData>>(new Map())
+  const [hoverCircleCenter, setHoverCircleCenter] = useState<[number, number] | null>(null)
+  const [cursorPosition, setCursorPosition] = useState<{ x: number; y: number } | null>(null)
+  const magnifyMapRef = useRef<maplibregl.Map | null>(null)
+
   const syncDrawnState = useCallback(() => {
     const draw = drawRef.current
     if (!draw) {
@@ -364,6 +376,9 @@ function App() {
     lastSubmittedAnalysisKeyRef.current = ''
     draw.changeMode('draw_polygon')
     setDrawMode('draw_polygon')
+
+    // Deactivate circle tool if active
+    setCircleToolActive(false)
   }, [clearAnalysisSource])
 
   const activateEditMode = useCallback(() => {
@@ -387,11 +402,119 @@ function App() {
     setDrawMode('direct_select')
   }, [drawnFeatureId])
 
+  // Circle tool helper functions
+  const updateLockedCirclesLayer = useCallback(() => {
+    const map = mapRef.current
+    if (!map) return
+
+    const features = lockedCircles.map(circle => ({
+      type: 'Feature' as const,
+      properties: {
+        id: circle.id,
+        color: circle.color,
+        label: circle.label,
+      },
+      geometry: createCirclePolygon(circle.center, circle.radius),
+    }))
+
+    const source = map.getSource('locked-circles-source') as maplibregl.GeoJSONSource
+    if (source) {
+      source.setData({
+        type: 'FeatureCollection',
+        features,
+      })
+    }
+  }, [lockedCircles])
+
+  const removeCircle = useCallback((circleId: string) => {
+    setLockedCircles(prev => prev.filter(c => c.id !== circleId))
+    setCircleMetrics(prev => {
+      const updated = new Map(prev)
+      updated.delete(circleId)
+      return updated
+    })
+  }, [])
+
+  const clearAllCircles = useCallback(() => {
+    setLockedCircles([])
+    setCircleMetrics(new Map())
+
+    const map = mapRef.current
+    if (!map) return
+
+    const hoverSource = map.getSource('hover-circle-source') as maplibregl.GeoJSONSource
+    if (hoverSource) {
+      hoverSource.setData(emptyFeatureCollection())
+    }
+
+    const lockedSource = map.getSource('locked-circles-source') as maplibregl.GeoJSONSource
+    if (lockedSource) {
+      lockedSource.setData(emptyFeatureCollection())
+    }
+  }, [])
+
   const citiesQuery = useQuery({
     queryKey: ['cities'],
     queryFn: getCities,
   })
   const effectiveCity = selectedCity || citiesQuery.data?.cities?.[0]?.city || ''
+
+  const analyzeCircle = useCallback(async (circle: LockedCircle) => {
+    // Convert circle to polygon
+    const polygon = createCirclePolygon(circle.center, circle.radius)
+
+    // Set loading state
+    setCircleMetrics(prev => new Map(prev).set(circle.id, {
+      circleId: circle.id,
+      isLoading: true,
+      metrics: {},
+      qualitySummary: {},
+      location: circle.location,
+    }))
+
+    try {
+      // Call existing analyse API
+      const response = await analyse({
+        mode: 'custom_polygon',
+        city: effectiveCity,
+        geometry: polygon,
+        run_async: true,
+      })
+
+      if (isJobResponse(response)) {
+        // Store job ID for polling
+        setCircleMetrics(prev => {
+          const updated = new Map(prev)
+          const existing = updated.get(circle.id)
+          if (existing) {
+            updated.set(circle.id, { ...existing, jobId: response.job_id })
+          }
+          return updated
+        })
+
+        // Start polling - we'll handle this with a separate effect
+        setActiveJobId(response.job_id)
+      } else {
+        // Immediate result
+        setCircleMetrics(prev => new Map(prev).set(circle.id, {
+          circleId: circle.id,
+          isLoading: false,
+          metrics: response.result,
+          qualitySummary: {},
+          location: circle.location,
+        }))
+      }
+    } catch (error) {
+      console.error('Circle analysis failed:', error)
+      setCircleMetrics(prev => new Map(prev).set(circle.id, {
+        circleId: circle.id,
+        isLoading: false,
+        metrics: { error: 'Analysis failed' },
+        qualitySummary: {},
+        location: circle.location,
+      }))
+    }
+  }, [effectiveCity])
 
   const wardsQuery = useQuery({
     queryKey: ['city-wards', effectiveCity],
@@ -733,6 +856,18 @@ function App() {
     }
   }, [activeJob?.status])
 
+  // Update locked circles layer when circles change
+  useEffect(() => {
+    updateLockedCirclesLayer()
+  }, [updateLockedCirclesLayer])
+
+  // Clear circles when city changes
+  useEffect(() => {
+    if (effectiveCity) {
+      clearAllCircles()
+    }
+  }, [effectiveCity, clearAllCircles])
+
   const activeJobElapsedSeconds = useMemo(() => {
     if (!activeJob) {
       return 0
@@ -985,6 +1120,190 @@ function App() {
       displayControlsDefault: false,
       controls: {},
       defaultMode: 'simple_select',
+      styles: [
+        // Fix line-dasharray compatibility with MapLibre GL
+        {
+          id: 'gl-draw-polygon-fill-inactive',
+          type: 'fill',
+          filter: ['all', ['==', 'active', 'false'], ['==', '$type', 'Polygon'], ['!=', 'mode', 'static']],
+          paint: {
+            'fill-color': '#3bb2d0',
+            'fill-outline-color': '#3bb2d0',
+            'fill-opacity': 0.1
+          }
+        },
+        {
+          id: 'gl-draw-polygon-fill-active',
+          type: 'fill',
+          filter: ['all', ['==', 'active', 'true'], ['==', '$type', 'Polygon']],
+          paint: {
+            'fill-color': '#fbb03b',
+            'fill-outline-color': '#fbb03b',
+            'fill-opacity': 0.1
+          }
+        },
+        {
+          id: 'gl-draw-polygon-midpoint',
+          type: 'circle',
+          filter: ['all', ['==', '$type', 'Point'], ['==', 'meta', 'midpoint']],
+          paint: {
+            'circle-radius': 3,
+            'circle-color': '#fbb03b'
+          }
+        },
+        {
+          id: 'gl-draw-polygon-stroke-inactive',
+          type: 'line',
+          filter: ['all', ['==', 'active', 'false'], ['==', '$type', 'Polygon'], ['!=', 'mode', 'static']],
+          layout: {
+            'line-cap': 'round',
+            'line-join': 'round'
+          },
+          paint: {
+            'line-color': '#3bb2d0',
+            'line-width': 2
+          }
+        },
+        {
+          id: 'gl-draw-polygon-stroke-active',
+          type: 'line',
+          filter: ['all', ['==', 'active', 'true'], ['==', '$type', 'Polygon']],
+          layout: {
+            'line-cap': 'round',
+            'line-join': 'round'
+          },
+          paint: {
+            'line-color': '#fbb03b',
+            'line-width': 2
+          }
+        },
+        {
+          id: 'gl-draw-line-inactive',
+          type: 'line',
+          filter: ['all', ['==', 'active', 'false'], ['==', '$type', 'LineString'], ['!=', 'mode', 'static']],
+          layout: {
+            'line-cap': 'round',
+            'line-join': 'round'
+          },
+          paint: {
+            'line-color': '#3bb2d0',
+            'line-width': 2
+          }
+        },
+        {
+          id: 'gl-draw-line-active',
+          type: 'line',
+          filter: ['all', ['==', '$type', 'LineString'], ['==', 'active', 'true']],
+          layout: {
+            'line-cap': 'round',
+            'line-join': 'round'
+          },
+          paint: {
+            'line-color': '#fbb03b',
+            'line-width': 2
+          }
+        },
+        {
+          id: 'gl-draw-polygon-and-line-vertex-stroke-inactive',
+          type: 'circle',
+          filter: ['all', ['==', 'meta', 'vertex'], ['==', '$type', 'Point'], ['!=', 'mode', 'static']],
+          paint: {
+            'circle-radius': 5,
+            'circle-color': '#fff'
+          }
+        },
+        {
+          id: 'gl-draw-polygon-and-line-vertex-inactive',
+          type: 'circle',
+          filter: ['all', ['==', 'meta', 'vertex'], ['==', '$type', 'Point'], ['!=', 'mode', 'static']],
+          paint: {
+            'circle-radius': 3,
+            'circle-color': '#fbb03b'
+          }
+        },
+        {
+          id: 'gl-draw-point-point-stroke-inactive',
+          type: 'circle',
+          filter: ['all', ['==', 'active', 'false'], ['==', '$type', 'Point'], ['==', 'meta', 'feature'], ['!=', 'mode', 'static']],
+          paint: {
+            'circle-radius': 5,
+            'circle-opacity': 1,
+            'circle-color': '#fff'
+          }
+        },
+        {
+          id: 'gl-draw-point-inactive',
+          type: 'circle',
+          filter: ['all', ['==', 'active', 'false'], ['==', '$type', 'Point'], ['==', 'meta', 'feature'], ['!=', 'mode', 'static']],
+          paint: {
+            'circle-radius': 3,
+            'circle-color': '#3bb2d0'
+          }
+        },
+        {
+          id: 'gl-draw-point-stroke-active',
+          type: 'circle',
+          filter: ['all', ['==', '$type', 'Point'], ['==', 'active', 'true'], ['!=', 'meta', 'midpoint']],
+          paint: {
+            'circle-radius': 7,
+            'circle-color': '#fff'
+          }
+        },
+        {
+          id: 'gl-draw-point-active',
+          type: 'circle',
+          filter: ['all', ['==', '$type', 'Point'], ['!=', 'meta', 'midpoint'], ['==', 'active', 'true']],
+          paint: {
+            'circle-radius': 5,
+            'circle-color': '#fbb03b'
+          }
+        },
+        {
+          id: 'gl-draw-polygon-fill-static',
+          type: 'fill',
+          filter: ['all', ['==', 'mode', 'static'], ['==', '$type', 'Polygon']],
+          paint: {
+            'fill-color': '#404040',
+            'fill-outline-color': '#404040',
+            'fill-opacity': 0.1
+          }
+        },
+        {
+          id: 'gl-draw-polygon-stroke-static',
+          type: 'line',
+          filter: ['all', ['==', 'mode', 'static'], ['==', '$type', 'Polygon']],
+          layout: {
+            'line-cap': 'round',
+            'line-join': 'round'
+          },
+          paint: {
+            'line-color': '#404040',
+            'line-width': 2
+          }
+        },
+        {
+          id: 'gl-draw-line-static',
+          type: 'line',
+          filter: ['all', ['==', 'mode', 'static'], ['==', '$type', 'LineString']],
+          layout: {
+            'line-cap': 'round',
+            'line-join': 'round'
+          },
+          paint: {
+            'line-color': '#404040',
+            'line-width': 2
+          }
+        },
+        {
+          id: 'gl-draw-point-static',
+          type: 'circle',
+          filter: ['all', ['==', 'mode', 'static'], ['==', '$type', 'Point']],
+          paint: {
+            'circle-radius': 5,
+            'circle-color': '#404040'
+          }
+        }
+      ]
     })
 
     map.addControl(draw as unknown as maplibregl.IControl, 'top-left')
@@ -1119,6 +1438,90 @@ function App() {
             'circle-stroke-color': '#fffbeb',
             'circle-stroke-width': 1.2,
             'circle-opacity': 0.9,
+          },
+        })
+      }
+
+      // Circle tool sources and layers
+      if (!map.getSource('hover-circle-source')) {
+        map.addSource('hover-circle-source', {
+          type: 'geojson',
+          data: emptyFeatureCollection(),
+        })
+      }
+
+      if (!map.getLayer('hover-circle-fill')) {
+        map.addLayer({
+          id: 'hover-circle-fill',
+          type: 'fill',
+          source: 'hover-circle-source',
+          paint: {
+            'fill-color': '#D97706',
+            'fill-opacity': 0.15,
+          },
+        })
+      }
+
+      if (!map.getLayer('hover-circle-line')) {
+        map.addLayer({
+          id: 'hover-circle-line',
+          type: 'line',
+          source: 'hover-circle-source',
+          paint: {
+            'line-color': '#D97706',
+            'line-width': 3,
+            'line-opacity': 0.9,
+          },
+        })
+      }
+
+      if (!map.getSource('locked-circles-source')) {
+        map.addSource('locked-circles-source', {
+          type: 'geojson',
+          data: emptyFeatureCollection(),
+        })
+      }
+
+      if (!map.getLayer('locked-circles-fill')) {
+        map.addLayer({
+          id: 'locked-circles-fill',
+          type: 'fill',
+          source: 'locked-circles-source',
+          paint: {
+            'fill-color': ['get', 'color'],
+            'fill-opacity': 0.15,
+          },
+        })
+      }
+
+      if (!map.getLayer('locked-circles-line')) {
+        map.addLayer({
+          id: 'locked-circles-line',
+          type: 'line',
+          source: 'locked-circles-source',
+          paint: {
+            'line-color': ['get', 'color'],
+            'line-width': 2.5,
+            'line-opacity': 0.9,
+          },
+        })
+      }
+
+      if (!map.getLayer('locked-circles-labels')) {
+        map.addLayer({
+          id: 'locked-circles-labels',
+          type: 'symbol',
+          source: 'locked-circles-source',
+          layout: {
+            'text-field': ['get', 'label'],
+            'text-size': 14,
+            'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+            'text-offset': [0, -2],
+          },
+          paint: {
+            'text-color': ['get', 'color'],
+            'text-halo-color': '#ffffff',
+            'text-halo-width': 2,
           },
         })
       }
@@ -1313,6 +1716,124 @@ function App() {
     map.getCanvas().style.cursor = isLocked ? 'crosshair' : ''
   }, [drawMode])
 
+  // Circle tool hover interaction
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || !circleToolActive) {
+      // Clear hover circle when tool is inactive
+      const hoverSource = map?.getSource('hover-circle-source') as maplibregl.GeoJSONSource | undefined
+      if (hoverSource) {
+        hoverSource.setData(emptyFeatureCollection())
+      }
+      return
+    }
+
+    let lastUpdateTime = 0
+    const THROTTLE_MS = 50
+
+    const handleMouseMove = (event: MapMouseEvent) => {
+      const now = Date.now()
+      if (now - lastUpdateTime < THROTTLE_MS) {
+        return
+      }
+      lastUpdateTime = now
+
+      const { lng, lat } = event.lngLat
+
+      // Update hover circle center and cursor position for magnifying lens
+      setHoverCircleCenter([lng, lat])
+      setCursorPosition({ x: event.originalEvent.clientX, y: event.originalEvent.clientY })
+
+      // Update hover circle source
+      const polygon = createCirclePolygon([lng, lat], circleRadius)
+      const source = map.getSource('hover-circle-source') as maplibregl.GeoJSONSource
+      if (source) {
+        source.setData({
+          type: 'Feature',
+          properties: {},
+          geometry: polygon,
+        })
+      }
+
+      // Update magnifying lens position if it exists
+      if (magnifyMapRef.current) {
+        const magnifyZoom = Math.min(map.getZoom() + 3, 19)
+        magnifyMapRef.current.setCenter([lng, lat])
+        magnifyMapRef.current.setZoom(magnifyZoom)
+      }
+    }
+
+    map.on('mousemove', handleMouseMove)
+    map.getCanvas().style.cursor = 'crosshair'
+
+    return () => {
+      map.off('mousemove', handleMouseMove)
+      if (!isDrawInteractionMode(drawMode)) {
+        map.getCanvas().style.cursor = ''
+      }
+      // Clear hover states on cleanup
+      setHoverCircleCenter(null)
+      setCursorPosition(null)
+    }
+  }, [circleToolActive, circleRadius, drawMode])
+
+  // Circle tool click to lock
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || !circleToolActive) {
+      return
+    }
+
+    const handleMapClick = async (event: MapMouseEvent) => {
+      // Check if we already have max circles
+      if (lockedCircles.length >= 4) {
+        alert('Maximum 4 circles reached. Remove a circle to add a new one.')
+        return
+      }
+
+      const { lng, lat } = event.lngLat
+
+      // Create locked circle
+      const circleId = `circle-${Date.now()}`
+      const newCircle: LockedCircle = {
+        id: circleId,
+        center: [lng, lat],
+        radius: circleRadius,
+        color: getCircleColor(lockedCircles.length),
+        label: getCircleLabel(lockedCircles.length),
+        location: null,
+        createdAt: Date.now(),
+      }
+
+      setLockedCircles(prev => [...prev, newCircle])
+
+      // Clear hover circle and lens
+      const hoverSource = map.getSource('hover-circle-source') as maplibregl.GeoJSONSource
+      if (hoverSource) {
+        hoverSource.setData(emptyFeatureCollection())
+      }
+      setHoverCircleCenter(null)
+      setCursorPosition(null)
+
+      // Start async analysis
+      analyzeCircle(newCircle)
+    }
+
+    map.on('click', handleMapClick)
+
+    return () => {
+      map.off('click', handleMapClick)
+    }
+  }, [circleToolActive, circleRadius, lockedCircles, analyzeCircle])
+
+  // Cleanup magnifying map when circle tool is disabled
+  useEffect(() => {
+    if (!circleToolActive && magnifyMapRef.current) {
+      magnifyMapRef.current.remove()
+      magnifyMapRef.current = null
+    }
+  }, [circleToolActive])
+
   useEffect(() => {
     if (!effectiveCity) {
       return
@@ -1424,7 +1945,47 @@ function App() {
               </button>
             </div>
 
-            <p className="mt-3 rounded-2xl border border-cyan-100 bg-cyan-50 px-3 py-2 text-sm text-cyan-900">{drawGuidance}</p>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                className={`rounded-full px-4 py-2 text-xs font-semibold transition ${
+                  circleToolActive
+                    ? 'bg-amber-600 text-white hover:bg-amber-700'
+                    : 'border border-stone-300 bg-white text-slate-700 hover:bg-stone-50'
+                }`}
+                onClick={() => {
+                  setCircleToolActive(!circleToolActive)
+                  if (!circleToolActive && drawMode !== 'simple_select') {
+                    // Deactivate polygon draw if active
+                    const draw = drawRef.current
+                    if (draw) {
+                      draw.changeMode('simple_select')
+                      setDrawMode('simple_select')
+                    }
+                  }
+                }}
+              >
+                🔍 Circle Tool
+              </button>
+              {circleToolActive && (
+                <select
+                  value={circleRadius}
+                  onChange={(e) => setCircleRadius(Number(e.target.value))}
+                  className="rounded-full border border-amber-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 outline-none transition focus:border-amber-600 focus:ring-2 focus:ring-amber-100"
+                >
+                  <option value={250}>250m radius</option>
+                  <option value={500}>500m radius</option>
+                  <option value={1000}>1km radius</option>
+                  <option value={2000}>2km radius</option>
+                </select>
+              )}
+            </div>
+
+            <p className="mt-3 rounded-2xl border border-cyan-100 bg-cyan-50 px-3 py-2 text-sm text-cyan-900">
+              {circleToolActive
+                ? '🔍 Circle tool active: Move cursor to preview, click to lock a circle for analysis (max 4).'
+                : drawGuidance}
+            </p>
 
             {geometryValidation.errors.length > 0 ? (
               <div className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 p-3 text-[11px] text-rose-700">
@@ -1466,6 +2027,92 @@ function App() {
               </div>
             ) : null}
           </section>
+
+          {lockedCircles.length > 0 && (
+            <section className="mt-4 rounded-[24px] border border-amber-200 bg-amber-50/50 p-4 shadow-sm">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-amber-700">Circle Analysis</p>
+                  <h2 className="mt-1 text-xl text-slate-900">Neighborhood comparisons</h2>
+                </div>
+                <button
+                  type="button"
+                  className="rounded-full border border-amber-300 bg-white px-3 py-1 text-[11px] font-semibold text-amber-700 transition hover:bg-amber-100"
+                  onClick={clearAllCircles}
+                >
+                  Clear All
+                </button>
+              </div>
+
+              <div className="mt-4 space-y-3">
+                {lockedCircles.map((circle) => {
+                  const metrics = circleMetrics.get(circle.id)
+
+                  return (
+                    <article
+                      key={circle.id}
+                      className="rounded-[22px] border-2 bg-white p-4"
+                      style={{ borderColor: circle.color }}
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="flex-1">
+                          <div className="flex items-center gap-2">
+                            <span
+                              className="flex h-6 w-6 items-center justify-center rounded-full text-xs font-bold text-white"
+                              style={{ backgroundColor: circle.color }}
+                            >
+                              {circle.label}
+                            </span>
+                            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                              Location {circle.label}
+                            </p>
+                          </div>
+                          <p className="mt-2 text-xs text-slate-600">
+                            📍 {circle.location || `${circle.center[1].toFixed(4)}, ${circle.center[0].toFixed(4)}`}
+                          </p>
+                          <p className="mt-1 text-xs text-slate-500">
+                            Radius: {circle.radius}m · Area: {((Math.PI * circle.radius * circle.radius) / 1_000_000).toFixed(3)} km²
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          className="text-slate-400 transition hover:text-red-500"
+                          onClick={() => removeCircle(circle.id)}
+                        >
+                          <span className="text-xl">×</span>
+                        </button>
+                      </div>
+
+                      {metrics?.isLoading ? (
+                        <div className="mt-3 rounded-2xl border border-stone-200 bg-stone-50 p-3 text-xs text-slate-500">
+                          <div className="flex items-center gap-2">
+                            <div className="h-4 w-4 animate-spin rounded-full border-2 border-slate-300 border-t-slate-600" />
+                            <span>Calculating metrics...</span>
+                          </div>
+                        </div>
+                      ) : metrics?.metrics && Object.keys(metrics.metrics).length > 0 ? (
+                        <div className="mt-3 space-y-2">
+                          {buildMetricPanelRows(metrics.metrics, metaMetricsQuery.data?.metrics ?? []).slice(0, 8).map((row) => (
+                            <div key={row.metric_id} className="flex justify-between rounded-2xl border border-stone-200 bg-stone-50 px-3 py-2">
+                              <span className="text-xs text-slate-600">{row.label}</span>
+                              <span className="text-xs font-semibold text-slate-900">
+                                {row.valueDisplay}
+                                {row.unit && <span className="ml-1 font-normal text-slate-500">{row.unit}</span>}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : metrics?.metrics?.error ? (
+                        <div className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700">
+                          Analysis failed. Please try again.
+                        </div>
+                      ) : null}
+                    </article>
+                  )
+                })}
+              </div>
+            </section>
+          )}
 
           <section className="mt-4 rounded-[24px] border border-stone-200 bg-white/95 p-4 shadow-sm">
             <div className="flex items-center justify-between gap-3">
@@ -1575,6 +2222,78 @@ function App() {
         <main className="urbanmor-mapframe col-span-12 overflow-hidden rounded-[30px] md:col-span-8 lg:col-span-9">
           <div className="relative h-full w-full">
             <div ref={mapContainerRef} className="h-full w-full" />
+
+            {/* Magnifying Lens Overlay */}
+            {circleToolActive && hoverCircleCenter && cursorPosition && (
+              <div
+                className="absolute pointer-events-none"
+                style={{
+                  left: `${cursorPosition.x}px`,
+                  top: `${cursorPosition.y}px`,
+                  transform: 'translate(-100px, -100px)', // Center the 200px lens on cursor
+                  zIndex: 1000
+                }}
+              >
+                <div
+                  style={{
+                    width: '200px',
+                    height: '200px',
+                    borderRadius: '50%',
+                    overflow: 'hidden',
+                    border: '3px solid #D97706',
+                    boxShadow: '0 0 0 2px rgba(217, 119, 6, 0.3), 0 8px 24px rgba(0, 0, 0, 0.6)',
+                    position: 'relative'
+                  }}
+                >
+                  <div
+                    ref={(el) => {
+                      if (!el || magnifyMapRef.current) return
+
+                      // Initialize magnifying map
+                      const magnifyMap = new maplibregl.Map({
+                        container: el,
+                        style: createBasemapStyle(),
+                        center: hoverCircleCenter,
+                        zoom: Math.min((mapRef.current?.getZoom() || 10) + 3, 19),
+                        interactive: false,
+                        attributionControl: false
+                      })
+
+                      magnifyMapRef.current = magnifyMap
+                    }}
+                    style={{ width: '100%', height: '100%' }}
+                  />
+
+                  {/* Lens gloss effect */}
+                  <div
+                    style={{
+                      position: 'absolute',
+                      top: '-3px',
+                      left: '-3px',
+                      right: '-3px',
+                      bottom: '-3px',
+                      borderRadius: '50%',
+                      background: 'linear-gradient(135deg, rgba(255,255,255,0.3) 0%, transparent 50%, rgba(0,0,0,0.2) 100%)',
+                      pointerEvents: 'none'
+                    }}
+                  />
+
+                  {/* Center crosshair */}
+                  <div
+                    style={{
+                      position: 'absolute',
+                      left: '50%',
+                      top: '50%',
+                      transform: 'translate(-50%, -50%)',
+                      pointerEvents: 'none'
+                    }}
+                  >
+                    <div style={{ position: 'absolute', width: '20px', height: '2px', background: '#D97706', left: '-10px', top: '-1px', opacity: 0.8 }} />
+                    <div style={{ position: 'absolute', width: '2px', height: '20px', background: '#D97706', left: '-1px', top: '-10px', opacity: 0.8 }} />
+                  </div>
+                </div>
+              </div>
+            )}
 
             <div className="absolute left-4 top-4 z-10 max-w-sm rounded-[22px] border border-white/70 bg-white/92 p-4 shadow-lg backdrop-blur pointer-events-none">
               <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">How to use</p>

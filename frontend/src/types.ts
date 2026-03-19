@@ -145,3 +145,30 @@ export interface CityMapLayerGeoJSONResponse extends FeatureCollection<Geometry,
   layer: 'roads' | 'transit'
   feature_count: number
 }
+
+export interface LockedCircle {
+  id: string
+  center: [number, number]  // [lng, lat]
+  radius: number            // meters
+  color: string
+  label: string             // A, B, C, D
+  location: string | null   // From reverse geocoding
+  createdAt: number
+}
+
+export interface CircleMetricsData {
+  circleId: string
+  jobId?: string           // For polling
+  isLoading: boolean
+  metrics: Record<string, unknown>
+  qualitySummary: Record<string, unknown>
+  location: string | null
+}
+
+export interface PreviewMetrics {
+  area_km2: number
+  cnr_estimate: number | null
+  intersection_density: number | null
+  intersection_count: number | null
+  open_ratio: number | null
+}
