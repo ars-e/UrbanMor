@@ -50,7 +50,7 @@ export interface WardMetricResponse {
   ward_name: string | null
   vintage_year: number
   metrics_json: {
-    all_metrics?: Record<string, number | null>
+    all_metrics?: Record<string, unknown>
     [key: string]: unknown
   }
   quality_summary: Record<string, unknown>
@@ -159,6 +159,9 @@ export interface LockedCircle {
 export interface CircleMetricsData {
   circleId: string
   jobId?: string           // For polling
+  status?: AnalyseJobStatus
+  progressPct?: number
+  progressMessage?: string | null
   isLoading: boolean
   metrics: Record<string, unknown>
   qualitySummary: Record<string, unknown>

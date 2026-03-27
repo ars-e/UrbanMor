@@ -2,7 +2,9 @@ import asyncio
 import json
 import logging
 import math
+import os
 import re
+import sys
 import time
 import uuid
 from collections import defaultdict
@@ -70,6 +72,44 @@ _COMPOSITE_METRIC_IDS = (
     "cmp.compactness",
 )
 
+# Zero-value counts are informational. A narrower alert subset helps avoid
+# treating legitimate zeros (e.g., urban agriculture share) as suspicious.
+_ZERO_ALERT_METRIC_IDS = frozenset(
+    {
+        "road.intersection_density",
+        "road.node_density",
+        "road.edge_density",
+        "transit.stop_density",
+        "transit.coverage_500m",
+    }
+)
+
+
+def _resolve_metrics_registry_path() -> Path | None:
+    candidates: list[Path] = []
+
+    env_path = os.getenv("URBANMOR_METRICS_REGISTRY_PATH", "").strip()
+    if env_path:
+        candidates.append(Path(env_path).expanduser())
+
+    # Standard source-tree layout (repo checkout).
+    candidates.append(Path(__file__).resolve().parents[3] / "metrics_registry.yaml")
+
+    # PyInstaller/Nuitka-like frozen layouts.
+    frozen_root = getattr(sys, "_MEIPASS", "")
+    if isinstance(frozen_root, str) and frozen_root:
+        candidates.append(Path(frozen_root) / "metrics_registry.yaml")
+
+    # Side-by-side binary/resource layout.
+    executable_path = Path(sys.executable).resolve()
+    candidates.append(executable_path.parent / "metrics_registry.yaml")
+    candidates.append(executable_path.parent.parent / "Resources" / "metrics_registry.yaml")
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
 
 def _cleanup_background_task(task: asyncio.Task[Any]) -> None:
     _BACKGROUND_TASKS.discard(task)
@@ -92,6 +132,7 @@ async def run_custom_polygon_job(job_id: str) -> None:
 class AnalyseService:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
+        self._cache_fresh_checked: set[tuple[str, int]] = set()
 
     async def _execute(self, label: str, sql: str, params: dict[str, Any] | None = None):
         start = time.perf_counter()
@@ -189,6 +230,7 @@ class AnalyseService:
 
         road_intersection_density = m("road.intersection_density")
         road_cnr = m("road.cnr")
+        road_culdesac_ratio = m("road.culdesac_ratio")
         road_ped_ratio = m("road.pedestrian_infra_ratio")
         transit_coverage = m("transit.coverage_500m")
         transit_distance_m = m("transit.distance_to_metro_or_rail")
@@ -210,40 +252,36 @@ class AnalyseService:
         green_cover = m("lulc.green_cover_pct")
         vacant_pct = m("open.vacant_land_pct")
         density_norm = cls._clamp_0_100(((bldg_density / 250.0) * 100.0)) if bldg_density is not None else None
-        connectivity_score = (100.0 - road_cnr) if road_cnr is not None else None
-        greenness_inv = (100.0 - green_cover) if green_cover is not None else None
+        greenness_inv = cls._clamp_0_100(100.0 - green_cover) if green_cover is not None else None
         informality = cls._clamp_0_100(cls._weighted_score([
             (density_norm, 0.35),
-            (connectivity_score, 0.25),
+            (road_culdesac_ratio, 0.25),
             (greenness_inv, 0.20),
             (vacant_pct, 0.20),
         ]))
 
         impervious = m("lulc.impervious_ratio")
-        bcr = m("bldg.bcr")
         flat_area = m("topo.flat_area_pct")
         heat_island = cls._clamp_0_100(cls._weighted_score([
-            (impervious, 0.35),
-            (bcr, 0.25),
-            (greenness_inv, 0.25),
+            (impervious, 0.50),
+            (greenness_inv, 0.35),
             (flat_area, 0.15),
         ]))
 
         road_edge_density = m("road.edge_density")
         edge_norm = cls._clamp_0_100(((road_edge_density / 30.0) * 100.0)) if road_edge_density is not None else None
+        low_density_score = (100.0 - density_norm) if density_norm is not None else None
         development_pressure = cls._clamp_0_100(cls._weighted_score([
-            (vacant_pct, 0.40),
-            (density_norm, 0.35),
-            (edge_norm, 0.25),
+            (vacant_pct, 0.50),
+            (low_density_score, 0.20),
+            (edge_norm, 0.30),
         ]))
 
         topo_natural_constraint = m("topo.natural_constraint_index")
         topo_steep_pct = m("topo.steep_area_pct")
-        # Flood-risk proxy was retired; weights below are renormalized from 0.5/0.3.
-        topographic_constraint = cls._clamp_0_100(cls._weighted_score([
-            (topo_natural_constraint, 0.625),
-            (topo_steep_pct, 0.375),
-        ]))
+        topographic_constraint = cls._clamp_0_100(
+            topo_natural_constraint if topo_natural_constraint is not None else topo_steep_pct
+        )
 
         distance_to_park_m = m("open.distance_to_nearest_park")
         park_density = m("open.park_green_space_density")
@@ -263,10 +301,11 @@ class AnalyseService:
             (green_accessibility, 0.45),
         ]))
 
+        bcr = m("bldg.bcr")
         lulc_mix_index = m("lulc.mix_index")
         road_circuity = m("road.circuity")
         intersection_norm_cmp = cls._clamp_0_100(((road_intersection_density / 120.0) * 100.0)) if road_intersection_density is not None else None
-        mix_norm = cls._clamp_0_100(((lulc_mix_index / 3.0) * 100.0)) if lulc_mix_index is not None else None
+        mix_norm = cls._clamp_0_100(((lulc_mix_index / math.log(11.0)) * 100.0)) if lulc_mix_index is not None else None
         if road_circuity is None:
             circuity_score = None
         elif road_circuity <= 1.0:
@@ -296,7 +335,11 @@ class AnalyseService:
         for metric_id in _RETIRED_METRIC_IDS:
             metrics.pop(metric_id, None)
 
-        metrics.update(self._compute_composite_metrics(metrics))
+        computed_composites = self._compute_composite_metrics(metrics)
+        for metric_id, value in computed_composites.items():
+            # Do not overwrite SQL-computed composite values when present.
+            if metric_id not in metrics or metrics.get(metric_id) is None:
+                metrics[metric_id] = value
 
         for metric_id in _RETIRED_METRIC_IDS:
             metrics.pop(metric_id, None)
@@ -313,9 +356,10 @@ class AnalyseService:
         array_metrics = 0
         boolean_metrics = 0
         string_metrics = 0
-        zero_metrics = 0
+        zero_numeric_metrics = 0
+        zero_alert_metrics = 0
 
-        for value in all_metrics.values():
+        for metric_id, value in all_metrics.items():
             if value is None:
                 null_metrics += 1
                 continue
@@ -327,7 +371,9 @@ class AnalyseService:
                 if math.isfinite(numeric):
                     numeric_metrics += 1
                     if abs(numeric) <= 1e-12:
-                        zero_metrics += 1
+                        zero_numeric_metrics += 1
+                        if metric_id in _ZERO_ALERT_METRIC_IDS:
+                            zero_alert_metrics += 1
                 else:
                     string_metrics += 1
                 continue
@@ -367,7 +413,9 @@ class AnalyseService:
                 "array_metrics": array_metrics,
                 "boolean_metrics": boolean_metrics,
                 "string_metrics": string_metrics,
-                "zero_metrics": zero_metrics,
+                "zero_metrics": zero_numeric_metrics,
+                "zero_alert_metrics": zero_alert_metrics,
+                "zero_metrics_informational": True,
                 "completeness_ratio": completeness_ratio,
                 "families_present": families_present,
             }
@@ -400,6 +448,60 @@ class AnalyseService:
         row["metrics_json"] = metrics_json
         row["quality_summary"] = quality_summary
         return row
+
+    async def _ensure_city_cache_fresh(self, city: str, vintage_year: int | None = None) -> None:
+        year = vintage_year if vintage_year is not None else time.gmtime().tm_year
+        key = (city, year)
+        if key in self._cache_fresh_checked:
+            return
+
+        has_input_signature_fn = bool(
+            await self._scalar(
+                "cache.input_signature.fn_exists",
+                "SELECT to_regprocedure('metrics._city_input_signature(text)') IS NOT NULL",
+            )
+        )
+        has_refresh_fn = bool(
+            await self._scalar(
+                "cache.refresh.fn_exists",
+                "SELECT to_regprocedure('metrics.refresh_ward_cache(integer,text)') IS NOT NULL",
+            )
+        )
+        if not has_input_signature_fn or not has_refresh_fn:
+            self._cache_fresh_checked.add(key)
+            return
+
+        layer_signature = await self._scalar(
+            "cache.input_signature.value",
+            "SELECT metrics._city_input_signature(:city)",
+            {"city": city},
+        )
+        if layer_signature is None:
+            self._cache_fresh_checked.add(key)
+            return
+
+        latest_cache_ts = await self._scalar(
+            "cache.city.latest_computed_at",
+            """
+            SELECT MAX(computed_at)
+            FROM metrics.ward_cache
+            WHERE city=:city
+              AND vintage_year=:year
+            """,
+            {"city": city, "year": year},
+        )
+
+        if latest_cache_ts is not None and latest_cache_ts >= layer_signature:
+            self._cache_fresh_checked.add(key)
+            return
+
+        await self._execute(
+            "cache.refresh.city",
+            "SELECT city, wards_seen, inserted_rows, updated_rows FROM metrics.refresh_ward_cache(:year, :city)",
+            {"year": year, "city": city},
+        )
+        await self.session.commit()
+        self._cache_fresh_checked.add(key)
 
     async def _resolve_city_ward_table(self, city: str) -> str:
         normalized = self._normalize_city(city)
@@ -1065,6 +1167,7 @@ class AnalyseService:
 
     async def get_ward_metrics(self, city: str, ward_id: str) -> WardMetricResponse:
         normalized = self._normalize_city(city)
+        await self._ensure_city_cache_fresh(normalized)
         row = (
             await self._execute(
                 "ward.metrics",
@@ -1096,6 +1199,7 @@ class AnalyseService:
 
     async def get_city_metrics(self, city: str) -> CityMetricsResponse:
         normalized = self._normalize_city(city)
+        await self._ensure_city_cache_fresh(normalized)
         rows = (
             await self._execute(
                 "city.metrics.latest_rows",
@@ -1191,8 +1295,8 @@ class AnalyseService:
                     metric.source_layers = ["slope_raster", "water_bodies"]
             return MetaMetricsResponse(source="meta.metric_registry", count=len(metrics), metrics=metrics)
 
-        registry_path = Path(__file__).resolve().parents[3] / "metrics_registry.yaml"
-        if not registry_path.exists():
+        registry_path = _resolve_metrics_registry_path()
+        if registry_path is None:
             raise HTTPException(status_code=404, detail="Metric registry not found")
 
         content = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
@@ -1244,6 +1348,7 @@ class AnalyseService:
 
     async def _analyse_wards(self, city: str, ward_ids: list[str] | None, limit: int) -> dict[str, Any]:
         normalized = self._normalize_city(city)
+        await self._ensure_city_cache_fresh(normalized)
         where_clause = "city=:city"
         params: dict[str, Any] = {"city": normalized, "limit": min(max(limit, 1), 1000)}
 

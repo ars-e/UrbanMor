@@ -1,6 +1,6 @@
 # Deploy UrbanMor Backend on Render (Hobby)
 
-This deploy path keeps your frontend on Vercel (`/urbanmorph`) and hosts the API + Postgres on Render.
+This deploy path keeps your frontend on Vercel (`/umv1`) and hosts the API + Postgres on Render.
 
 ## 1) Push code to GitHub
 
@@ -66,22 +66,22 @@ curl -sS https://urbanmor-api.onrender.com/cities
 
 Expected: JSON responses (not 404/500).
 
-## 5) Point frontend (`inkletlab.com/urbanmorph`) to Render API
+## 5) Point frontend (`inkletlab.com/umv1`) to Render API
 
 ```bash
 cd /Users/ars-e/projects/inklet-lab-site
-VITE_API_BASE_URL="https://urbanmor-api.onrender.com" npm run sync:urbanmorph
+VITE_API_BASE_URL="https://urbanmor-api.onrender.com" npm run sync:umv1
 vercel --prod --yes
 ```
 
 ## 6) Final verification
 
 ```bash
-curl -I https://www.inkletlab.com/urbanmorph/
+curl -I https://www.inkletlab.com/umv1/
 curl -sS https://urbanmor-api.onrender.com/health
 ```
 
-Note: if you do not configure `/urbanmorph-api` reverse proxy in Vercel, frontend still works by calling the full Render URL directly.
+Note: if you do not configure `/umv1-api` reverse proxy in Vercel, frontend still works by calling the full Render URL directly.
 
 ## Notes
 

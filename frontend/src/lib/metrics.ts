@@ -23,20 +23,22 @@ export interface MetricDeltaRow {
   metric_id: string
   label: string
   unit: string
-  current: number
-  reference: number
-  deltaAbs: number
+  current: number | null
+  reference: number | null
+  deltaAbs: number | null
   deltaPct: number | null
+  comparisonStatus: 'ok' | 'missing_current' | 'missing_reference' | 'missing_both'
 }
 
 export interface SideBySideRow {
   metric_id: string
   label: string
   unit: string
-  leftValue: number
-  rightValue: number
-  deltaAbs: number
+  leftValue: number | null
+  rightValue: number | null
+  deltaAbs: number | null
   deltaPct: number | null
+  comparisonStatus: 'ok' | 'missing_left' | 'missing_right' | 'missing_both'
 }
 
 interface ExportContext {
@@ -80,15 +82,48 @@ function formatNumeric(value: number): string {
 }
 
 function toNumeric(value: unknown): number | null {
-  if (typeof value !== 'number' || !Number.isFinite(value)) {
-    return null
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value
   }
-  return value
+  if (typeof value === 'string') {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) {
+      return parsed
+    }
+  }
+  return null
 }
 
-function formatValue(value: unknown): string {
+function formatObjectValue(metricId: string, value: Record<string, unknown>): string {
+  if (metricId === 'bldg.size_distribution') {
+    const p50 = toNumeric(value.p50_m2)
+    const p90 = toNumeric(value.p90_m2)
+    const variance = toNumeric(value.variance_m2)
+    const parts: string[] = []
+    if (p50 !== null) {
+      parts.push(`P50 ${formatNumeric(p50)} m²`)
+    }
+    if (p90 !== null) {
+      parts.push(`P90 ${formatNumeric(p90)} m²`)
+    }
+    if (variance !== null) {
+      parts.push(`Var ${formatNumeric(variance)} m²`)
+    }
+    if (parts.length > 0) {
+      return parts.join(' · ')
+    }
+  }
+
+  return JSON.stringify(value)
+}
+
+function formatValue(metricId: string, value: unknown): string {
   if (value === null || value === undefined) {
     return 'N/A'
+  }
+  const numeric = toNumeric(value)
+  if (numeric !== null) {
+    return formatNumeric(numeric)
   }
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) {
@@ -96,8 +131,8 @@ function formatValue(value: unknown): string {
     }
     return formatNumeric(value)
   }
-  if (typeof value === 'object') {
-    return 'Composite value'
+  if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+    return formatObjectValue(metricId, value as Record<string, unknown>)
   }
   return String(value)
 }
@@ -106,11 +141,11 @@ function qualityFlagForValue(value: unknown): string {
   if (value === null || value === undefined) {
     return 'not_computed'
   }
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) {
-      return 'invalid_numeric'
-    }
+  if (toNumeric(value) !== null) {
     return 'ok'
+  }
+  if (typeof value === 'number') {
+    return 'invalid_numeric'
   }
   if (typeof value === 'object') {
     return 'composite_object'
@@ -135,7 +170,7 @@ export function buildMetricPanelRows(
         family,
         frontendGroup: toGroupLabel(family),
         value,
-        valueDisplay: formatValue(value),
+        valueDisplay: formatValue(metricId, value),
         unit: meta?.unit || '-',
         explanation: meta?.formula_summary || 'No formula summary yet.',
         status: meta?.status || 'unknown',
@@ -181,13 +216,19 @@ export function buildDeltaRows(
 
   for (const row of currentRows) {
     const current = toNumeric(row.value)
-    const reference = referenceMap.get(row.metric_id)
-    if (current === null || reference === undefined) {
-      continue
+    const reference = referenceMap.get(row.metric_id) ?? null
+
+    let comparisonStatus: MetricDeltaRow['comparisonStatus'] = 'ok'
+    if (current === null && reference === null) {
+      comparisonStatus = 'missing_both'
+    } else if (current === null) {
+      comparisonStatus = 'missing_current'
+    } else if (reference === null) {
+      comparisonStatus = 'missing_reference'
     }
 
-    const deltaAbs = current - reference
-    const deltaPct = reference === 0 ? null : (deltaAbs / Math.abs(reference)) * 100
+    const deltaAbs = current !== null && reference !== null ? current - reference : null
+    const deltaPct = deltaAbs === null || reference === null || reference === 0 ? null : (deltaAbs / Math.abs(reference)) * 100
     deltas.push({
       metric_id: row.metric_id,
       label: row.label,
@@ -196,45 +237,73 @@ export function buildDeltaRows(
       reference,
       deltaAbs,
       deltaPct,
+      comparisonStatus,
     })
   }
 
-  return deltas.sort((a, b) => Math.abs(b.deltaAbs) - Math.abs(a.deltaAbs))
+  return deltas.sort((a, b) => {
+    const pctA = a.deltaPct === null ? -1 : Math.abs(a.deltaPct)
+    const pctB = b.deltaPct === null ? -1 : Math.abs(b.deltaPct)
+    if (pctB !== pctA) {
+      return pctB - pctA
+    }
+    const absA = a.deltaAbs === null ? -1 : Math.abs(a.deltaAbs)
+    const absB = b.deltaAbs === null ? -1 : Math.abs(b.deltaAbs)
+    return absB - absA
+  })
 }
 
 export function buildSideBySideRows(
   leftRows: MetricPanelRow[],
   rightRows: MetricPanelRow[],
 ): SideBySideRow[] {
+  const leftMap = new Map(leftRows.map((row) => [row.metric_id, row]))
   const rightMap = new Map(rightRows.map((row) => [row.metric_id, row]))
+  const metricIds = new Set<string>([...leftMap.keys(), ...rightMap.keys()])
   const rows: SideBySideRow[] = []
 
-  for (const left of leftRows) {
-    const right = rightMap.get(left.metric_id)
-    if (!right) {
-      continue
+  for (const metricId of metricIds) {
+    const left = leftMap.get(metricId)
+    const right = rightMap.get(metricId)
+    const label = left?.label ?? right?.label ?? metricId
+    const unit = left?.unit ?? right?.unit ?? '-'
+
+    const leftValue = left ? toNumeric(left.value) : null
+    const rightValue = right ? toNumeric(right.value) : null
+
+    let comparisonStatus: SideBySideRow['comparisonStatus'] = 'ok'
+    if (leftValue === null && rightValue === null) {
+      comparisonStatus = 'missing_both'
+    } else if (leftValue === null) {
+      comparisonStatus = 'missing_left'
+    } else if (rightValue === null) {
+      comparisonStatus = 'missing_right'
     }
 
-    const leftValue = toNumeric(left.value)
-    const rightValue = toNumeric(right.value)
-    if (leftValue === null || rightValue === null) {
-      continue
-    }
-
-    const deltaAbs = leftValue - rightValue
-    const deltaPct = rightValue === 0 ? null : (deltaAbs / Math.abs(rightValue)) * 100
+    const deltaAbs = leftValue !== null && rightValue !== null ? leftValue - rightValue : null
+    const deltaPct = deltaAbs === null || rightValue === null || rightValue === 0 ? null : (deltaAbs / Math.abs(rightValue)) * 100
     rows.push({
-      metric_id: left.metric_id,
-      label: left.label,
-      unit: left.unit,
+      metric_id: metricId,
+      label,
+      unit,
       leftValue,
       rightValue,
       deltaAbs,
       deltaPct,
+      comparisonStatus,
     })
   }
 
-  return rows.sort((a, b) => Math.abs(b.deltaAbs) - Math.abs(a.deltaAbs))
+  return rows.sort((a, b) => {
+    const pctA = a.deltaPct === null ? -1 : Math.abs(a.deltaPct)
+    const pctB = b.deltaPct === null ? -1 : Math.abs(b.deltaPct)
+    if (pctB !== pctA) {
+      return pctB - pctA
+    }
+    const absA = a.deltaAbs === null ? -1 : Math.abs(a.deltaAbs)
+    const absB = b.deltaAbs === null ? -1 : Math.abs(b.deltaAbs)
+    return absB - absA
+  })
 }
 
 export function formatMetricNumber(value: number): string {

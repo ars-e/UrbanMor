@@ -32,6 +32,20 @@ BEGIN
 END;
 $$;
 
+-- Cache dependency signature from canonical layer refresh timestamps.
+-- Includes city-specific and global rows (e.g., class maps).
+CREATE OR REPLACE FUNCTION metrics._city_input_signature(p_city text)
+RETURNS timestamptz
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT MAX(l.last_refresh_at)::timestamptz
+  FROM meta.layer_registry l
+  WHERE l.city = metrics._normalize_city(p_city)
+     OR l.city IS NULL
+     OR btrim(COALESCE(l.city, '')) = '';
+$$;
+
 -- Compact cache-level quality rollup derived from metrics.analyse_polygon payload.
 CREATE OR REPLACE FUNCTION metrics._metric_quality_summary(p_metrics_json jsonb)
 RETURNS jsonb
@@ -59,7 +73,18 @@ agg AS (
     COUNT(*) FILTER (
       WHERE vtype = 'number'
         AND abs((value::text)::numeric) <= 0.000000000001
-    )::int AS zero_metrics
+    )::int AS zero_numeric_metrics,
+    COUNT(*) FILTER (
+      WHERE vtype = 'number'
+        AND abs((value::text)::numeric) <= 0.000000000001
+        AND key IN (
+          'road.intersection_density',
+          'road.node_density',
+          'road.edge_density',
+          'transit.stop_density',
+          'transit.coverage_500m'
+        )
+    )::int AS zero_alert_metrics
   FROM flat
 ),
 families AS (
@@ -76,7 +101,9 @@ SELECT jsonb_build_object(
   'array_metrics', COALESCE(a.array_metrics, 0),
   'boolean_metrics', COALESCE(a.boolean_metrics, 0),
   'string_metrics', COALESCE(a.string_metrics, 0),
-  'zero_metrics', COALESCE(a.zero_metrics, 0),
+  'zero_metrics', COALESCE(a.zero_numeric_metrics, 0),
+  'zero_alert_metrics', COALESCE(a.zero_alert_metrics, 0),
+  'zero_metrics_informational', true,
   'completeness_ratio',
     CASE
       WHEN COALESCE(a.total_metrics, 0) = 0 THEN NULL
@@ -102,6 +129,7 @@ CREATE TABLE IF NOT EXISTS metrics.ward_cache (
   vintage_year integer NOT NULL,
   metrics_json jsonb NOT NULL DEFAULT '{}'::jsonb,
   quality_summary jsonb NOT NULL DEFAULT '{}'::jsonb,
+  input_signature timestamptz,
   computed_at timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT ward_cache_pk PRIMARY KEY (city, ward_id, vintage_year),
   CONSTRAINT ward_cache_city_not_blank_chk CHECK (btrim(city) <> ''),
@@ -109,11 +137,17 @@ CREATE TABLE IF NOT EXISTS metrics.ward_cache (
   CONSTRAINT ward_cache_vintage_year_chk CHECK (vintage_year BETWEEN 1900 AND 2100)
 );
 
+ALTER TABLE IF EXISTS metrics.ward_cache
+  ADD COLUMN IF NOT EXISTS input_signature timestamptz;
+
 CREATE INDEX IF NOT EXISTS idx_ward_cache_city_vintage
   ON metrics.ward_cache (city, vintage_year, ward_id);
 
 CREATE INDEX IF NOT EXISTS idx_ward_cache_computed_at
   ON metrics.ward_cache (computed_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ward_cache_input_signature
+  ON metrics.ward_cache (city, input_signature DESC, computed_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_ward_cache_metrics_json_gin
   ON metrics.ward_cache
@@ -136,7 +170,8 @@ SELECT DISTINCT ON (city, ward_id)
   vintage_year,
   metrics_json,
   quality_summary,
-  computed_at
+  computed_at,
+  input_signature
 FROM metrics.ward_cache
 ORDER BY city, ward_id, vintage_year DESC, computed_at DESC;
 
@@ -157,19 +192,26 @@ DECLARE
   r RECORD;
   v_city_filter text;
   v_sql text;
+  v_lock_key text;
+  v_lock_acquired boolean;
 BEGIN
-  -- Advisory lock prevents duplicate concurrent computation for the same city+year.
-  -- Lock key is a hash of the city filter (or 'all') combined with the vintage year.
-  PERFORM pg_advisory_xact_lock(
-    hashtext(COALESCE(p_city_filter, 'all') || ':' || p_vintage_year::text)
-  );
-
   IF p_vintage_year < 1900 OR p_vintage_year > 2100 THEN
     RAISE EXCEPTION 'p_vintage_year out of range (1900-2100): %', p_vintage_year;
   END IF;
 
   IF p_city_filter IS NOT NULL AND btrim(p_city_filter) <> '' THEN
     v_city_filter := metrics._normalize_city(p_city_filter);
+  END IF;
+
+  -- Non-blocking advisory lock:
+  -- avoid piling up waiting refresh calls from API traffic while a city refresh is in progress.
+  v_lock_key := COALESCE(v_city_filter, 'all') || ':' || p_vintage_year::text;
+  SELECT pg_try_advisory_xact_lock(hashtext(v_lock_key)) INTO v_lock_acquired;
+  IF NOT v_lock_acquired THEN
+    IF v_city_filter IS NOT NULL THEN
+      RETURN QUERY SELECT v_city_filter, 0::integer, 0::integer, 0::integer;
+    END IF;
+    RETURN;
   END IF;
 
   IF to_regprocedure('metrics.analyse_polygon(text,geometry)') IS NULL THEN
@@ -208,7 +250,8 @@ BEGIN
           sw.ward_id,
           sw.ward_uid,
           sw.ward_name,
-          metrics.analyse_polygon(sw.city, sw.geom) AS metrics_json
+          metrics.analyse_polygon(sw.city, sw.geom) AS metrics_json,
+          metrics._city_input_signature(sw.city) AS input_signature
         FROM source_wards sw
       ),
       upserted AS (
@@ -220,6 +263,7 @@ BEGIN
           vintage_year,
           metrics_json,
           quality_summary,
+          input_signature,
           computed_at
         )
         SELECT
@@ -230,6 +274,7 @@ BEGIN
           $1::integer AS vintage_year,
           c.metrics_json,
           metrics._metric_quality_summary(c.metrics_json) AS quality_summary,
+          c.input_signature,
           now() AS computed_at
         FROM computed c
         ON CONFLICT (city, ward_id, vintage_year)
@@ -238,6 +283,7 @@ BEGIN
               ward_name = EXCLUDED.ward_name,
               metrics_json = EXCLUDED.metrics_json,
               quality_summary = EXCLUDED.quality_summary,
+              input_signature = EXCLUDED.input_signature,
               computed_at = EXCLUDED.computed_at
         RETURNING (xmax = 0) AS inserted
       )

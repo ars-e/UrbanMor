@@ -66,7 +66,7 @@ metrics:
     category: 'road_network'
     display_default: false
     unit: 'sq_m'
-    formula_summary: 'Mean polygon area of blocks derived from the road network within geometry.'
+    formula_summary: 'Mean polygon area of polygons produced by polygonizing the noded motorized-road network inside geometry.'
     source_layers:
       - 'roads'
       - 'network_blocks'
@@ -82,7 +82,7 @@ metrics:
     category: 'road_network'
     display_default: false
     unit: 'sq_m2'
-    formula_summary: 'Variance of derived road-block polygon areas within geometry.'
+    formula_summary: 'Population variance of polygonized motorized-road block areas within geometry.'
     source_layers:
       - 'roads'
       - 'network_blocks'
@@ -98,7 +98,7 @@ metrics:
     category: 'road_network'
     display_default: false
     unit: 'index'
-    formula_summary: 'Street Connectivity Index computed as a normalized index from standardized component metrics.'
+    formula_summary: 'Normalized link-node ratio score: clamp((edge_count / node_count) / 2 * 100).'
     source_layers:
       - 'roads'
     feasibility: 'Medium'
@@ -206,11 +206,29 @@ metrics:
     category: 'transit'
     display_default: false
     unit: 'meters'
-    formula_summary: 'Average geodesic nearest distance from sampled interior points to metro, rail, or transit stop features.'
+    formula_summary: 'Average geodesic nearest distance from sampled interior points to metro/rail targets only.'
     source_layers:
       - 'metro_stations'
       - 'rail_stations'
+      - 'metro_entrances'
+    feasibility: 'Medium'
+    release_target: 'final'
+    status: 'planned'
+    null_rule: 'null_if_no_reference_features_available'
+    interpretation_direction: 'context_dependent'
+    frontend_group: 'Road & Transit Network'
+    validation_rule: 'value_non_negative'
+  - metric_id: 'transit.distance_to_bus_stop'
+    label: 'Distance to Nearest Bus Stop'
+    category: 'transit'
+    display_default: false
+    unit: 'meters'
+    formula_summary: 'Average geodesic nearest distance from sampled interior points to bus stop/platform/station features.'
+    source_layers:
       - 'transit_stops'
+      - 'public_transport_platforms'
+      - 'public_transport_shelters'
+      - 'public_transport_stations'
     feasibility: 'Medium'
     release_target: 'final'
     status: 'planned'
@@ -440,8 +458,8 @@ metrics:
     label: 'Land Use Mix Index (Shannon)'
     category: 'land_use_open_space'
     display_default: false
-    unit: 'index'
-    formula_summary: 'Shannon diversity index from land-use class shares within geometry.'
+    unit: 'nats'
+    formula_summary: 'Shannon entropy (nats) of land-use class pixel shares within geometry. Range 0–ln(11)≈2.4 for 11 ESRI classes; higher = more diverse.'
     source_layers:
       - 'lulc_raster'
     feasibility: 'High'
@@ -450,20 +468,20 @@ metrics:
     null_rule: 'null_if_geometry_invalid_or_required_layers_missing'
     interpretation_direction: 'context_dependent'
     frontend_group: 'Land Use & Open Space'
-    validation_rule: 'value_between_0_and_100_after_normalization'
+    validation_rule: 'value_non_negative'
   - metric_id: 'lulc.residential_cover_pct'
     label: 'Residential Cover %'
     category: 'land_use_open_space'
     display_default: false
     unit: 'percent'
-    formula_summary: 'Residential Cover % computed as percentage share of relevant area/features in geometry.'
+    formula_summary: 'Percent share of raster area flagged is_residential_proxy. Returns null unless the class map defines a residential proxy distinct from generic built-up.'
     source_layers:
       - 'lulc_raster'
       - 'lulc_class_map'
     feasibility: 'Medium'
     release_target: 'final'
     status: 'planned'
-    null_rule: 'null_if_geometry_invalid_or_required_layers_missing'
+    null_rule: 'null_if_geometry_invalid_or_required_layers_missing_or_no_distinct_residential_proxy'
     interpretation_direction: 'context_dependent'
     frontend_group: 'Land Use & Open Space'
     validation_rule: 'value_between_0_and_100'
@@ -690,7 +708,7 @@ metrics:
     category: 'composite'
     display_default: true
     unit: 'index'
-    formula_summary: 'Composite proxy from built-form, network, and land-use signatures.'
+    formula_summary: 'Composite proxy from building density, cul-de-sac prevalence, greenness deficit, and vacant-land share.'
     source_layers:
       - 'building_footprints'
       - 'roads'
@@ -707,7 +725,7 @@ metrics:
     category: 'composite'
     display_default: false
     unit: 'index_proxy'
-    formula_summary: 'Proxy composite from imperviousness, built intensity, and terrain context.'
+    formula_summary: 'Proxy composite from imperviousness, greenness deficit, and flat-terrain context.'
     source_layers:
       - 'lulc_raster'
       - 'building_footprints'
@@ -724,7 +742,7 @@ metrics:
     category: 'composite'
     display_default: false
     unit: 'index'
-    formula_summary: 'Composite index from vacant land availability, accessibility, and built intensity.'
+    formula_summary: 'Composite index from vacant land, low existing density headroom, and edge-density accessibility.'
     source_layers:
       - 'vacant_land'
       - 'roads'
@@ -741,7 +759,7 @@ metrics:
     category: 'composite'
     display_default: false
     unit: 'index'
-    formula_summary: 'Composite score combining natural-constraint index and steep-slope share.'
+    formula_summary: 'Topographic constraint score from natural-constraint index (fallback to steep-slope share when natural-constraint inputs are unavailable).'
     source_layers:
       - 'slope_raster'
       - 'water_bodies'
@@ -790,7 +808,7 @@ metrics:
     category: 'composite'
     display_default: false
     unit: 'index'
-    formula_summary: 'Composite urban-form compactness score from morphology and land-use patterns.'
+    formula_summary: 'Composite urban-form compactness score from BCR, intersection density, normalized land-use entropy, and circuity.'
     source_layers:
       - 'roads'
       - 'building_footprints'

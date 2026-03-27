@@ -20,7 +20,20 @@ import {
 } from './lib/api'
 import { buildHighlightCards, MAP_METRIC_IDS } from './lib/highlights'
 import { validateAndNormalizeGeometry } from './lib/geometry'
-import { areaSqKm, buildSelectedWardAoiGeometry, createBasemapStyle, formatAreaSqKm, serializeViewportBbox, type MapViewport } from './lib/map'
+import {
+  ALL_BASEMAP_LAYER_IDS,
+  BASEMAP_PRESETS,
+  areaSqKm,
+  basemapLayerIdsForPreset,
+  buildSelectedWardAoiGeometry,
+  createBasemapStyle,
+  formatAreaSqKm,
+  isDarkBasemapPreset,
+  isImageryBasemapPreset,
+  serializeViewportBbox,
+  type BasemapPresetId,
+  type MapViewport,
+} from './lib/map'
 import { createCirclePolygon, getCircleColor, getCircleLabel } from './lib/circle'
 import {
   buildMetricPanelRows,
@@ -61,17 +74,22 @@ DRAW_CLASSES.CONTROL_GROUP = 'maplibregl-ctrl-group'
 DRAW_CLASSES.ATTRIBUTION = 'maplibregl-ctrl-attrib'
 
 const DEFAULT_METRIC_ID = 'road.intersection_density'
+const DEFAULT_CITY_SLUG = 'delhi'
 const RETIRED_METRIC_IDS = new Set(['bldg.growth_rate', 'topo.flood_risk_proxy'])
 const CHOROPLETH_COLOR_STOPS = {
-  low: '#f5f1e6',
-  mid: '#f59e0b',
-  high: '#c2410c',
-  max: '#7c2d12',
+  low: '#fef3c7',
+  mid: '#f97316',
+  high: '#b91c1c',
+  max: '#4c0519',
 }
+const CIRCLE_RADIUS_OPTIONS = [250, 500, 1000, 2000] as const
+const MAX_COMPARE_CIRCLES = 4
+const CIRCLE_POLL_INTERVAL_MS = 1000
+const NON_METRIC_CIRCLE_KEYS = new Set(['cache_hit', 'city', 'computed_at', 'geom_hash', 'metrics_json', 'quality_summary', 'vintage_year'])
 
-type PanelSourceType = 'city' | 'ward' | 'selected_wards' | 'drawn_polygon'
+type PanelSourceType = 'city' | 'ward' | 'selected_wards' | 'drawn_polygon' | 'circle'
 type AutoAnalysisSource = 'selected_wards' | 'drawn_polygon' | null
-type BasemapMode = 'street' | 'satellite'
+type BasemapMode = BasemapPresetId
 
 interface PanelSnapshot {
   sourceType: PanelSourceType
@@ -89,6 +107,12 @@ function isJobResponse(value: AnalyseResponse | AnalyseJobResponse): value is An
 function toNumberOrNull(value: unknown): number | null {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value
+  }
+  if (typeof value === 'string') {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) {
+      return parsed
+    }
   }
   return null
 }
@@ -121,6 +145,58 @@ function formatElapsed(seconds: number): string {
   const mins = Math.floor(seconds / 60)
   const rem = seconds % 60
   return `${mins}m ${rem}s`
+}
+
+function formatCircleRadius(radiusMeters: number): string {
+  if (radiusMeters >= 1000) {
+    return `${radiusMeters / 1000}km`
+  }
+  return `${radiusMeters}m`
+}
+
+function parseCircleResultPayload(payload: Record<string, unknown> | null): {
+  metrics: Record<string, unknown>
+  qualitySummary: Record<string, unknown>
+  error?: string
+} {
+  if (!payload) {
+    return {
+      metrics: {},
+      qualitySummary: {},
+      error: 'No analysis result returned for this circle.',
+    }
+  }
+
+  const qualitySummaryValue = payload.quality_summary
+  const qualitySummary =
+    typeof qualitySummaryValue === 'object' && qualitySummaryValue !== null && !Array.isArray(qualitySummaryValue)
+      ? (qualitySummaryValue as Record<string, unknown>)
+      : {}
+
+  const metricsJsonValue = payload.metrics_json
+  if (typeof metricsJsonValue === 'object' && metricsJsonValue !== null && !Array.isArray(metricsJsonValue)) {
+    const allMetricsValue = (metricsJsonValue as { all_metrics?: unknown }).all_metrics
+    if (typeof allMetricsValue === 'object' && allMetricsValue !== null && !Array.isArray(allMetricsValue)) {
+      return {
+        metrics: allMetricsValue as Record<string, unknown>,
+        qualitySummary,
+      }
+    }
+  }
+
+  const fallbackEntries = Object.entries(payload).filter(([key]) => !NON_METRIC_CIRCLE_KEYS.has(key))
+  if (fallbackEntries.length > 0) {
+    return {
+      metrics: Object.fromEntries(fallbackEntries),
+      qualitySummary,
+    }
+  }
+
+  return {
+    metrics: {},
+    qualitySummary,
+    error: 'No computed metrics found in circle result.',
+  }
 }
 
 function computeBounds(geojson: WardsGeoJSON): [[number, number], [number, number]] | null {
@@ -231,7 +307,13 @@ function statusBadgeClass(status: string): string {
   return 'border-slate-200 bg-slate-100 text-slate-600'
 }
 
-function describeAoi(source: PanelSourceType, city: string, selectedFeatures: WardGeometryFeature[], drawnArea: number | null): { title: string; subtitle: string; areaLabel: string } {
+function describeAoi(
+  source: PanelSourceType,
+  city: string,
+  selectedFeatures: WardGeometryFeature[],
+  drawnArea: number | null,
+  selectedCircle: LockedCircle | null,
+): { title: string; subtitle: string; areaLabel: string } {
   if (source === 'drawn_polygon') {
     return {
       title: 'Drawn area of interest',
@@ -255,6 +337,15 @@ function describeAoi(source: PanelSourceType, city: string, selectedFeatures: Wa
       title: first?.properties.ward_name || first?.properties.ward_id || 'Selected ward',
       subtitle: 'Single ward AOI from cached ward metrics.',
       areaLabel: formatAreaSqKm(areaSqKm(buildSelectedWardAoiGeometry(selectedFeatures))),
+    }
+  }
+
+  if (source === 'circle' && selectedCircle) {
+    const circleAreaKm2 = (Math.PI * selectedCircle.radius * selectedCircle.radius) / 1_000_000
+    return {
+      title: `Circle ${selectedCircle.label} AOI`,
+      subtitle: selectedCircle.location || `${selectedCircle.center[1].toFixed(4)}, ${selectedCircle.center[0].toFixed(4)}`,
+      areaLabel: formatAreaSqKm(circleAreaKm2),
     }
   }
 
@@ -284,19 +375,28 @@ function App() {
   const [activeAnalysisKey, setActiveAnalysisKey] = useState<string>('')
   const [exportMessage, setExportMessage] = useState<string>('')
   const [jobClock, setJobClock] = useState<number>(Date.now())
-  const [basemapMode, setBasemapMode] = useState<BasemapMode>('street')
+  const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(false)
+  const [showMapGuide, setShowMapGuide] = useState<boolean>(false)
+  const [showMapPreview, setShowMapPreview] = useState<boolean>(true)
+  const [basemapMode, setBasemapMode] = useState<BasemapMode>('soft_light')
+  const [showWardLayer, setShowWardLayer] = useState<boolean>(true)
   const [showRoadOverlay, setShowRoadOverlay] = useState<boolean>(true)
   const [showTransitOverlay, setShowTransitOverlay] = useState<boolean>(true)
   const [mapViewport, setMapViewport] = useState<MapViewport | null>(null)
 
   // Circle tool state
-  const [circleToolActive, setCircleToolActive] = useState<boolean>(true) // Default enabled
+  const [circleToolActive, setCircleToolActive] = useState<boolean>(false)
   const [circleRadius, setCircleRadius] = useState<number>(250) // Start with smaller 250m radius
   const [lockedCircles, setLockedCircles] = useState<LockedCircle[]>([])
+  const [selectedAoiCircleId, setSelectedAoiCircleId] = useState<string>('')
   const [circleMetrics, setCircleMetrics] = useState<Map<string, CircleMetricsData>>(new Map())
   const [hoverCircleCenter, setHoverCircleCenter] = useState<[number, number] | null>(null)
   const [cursorPosition, setCursorPosition] = useState<{ x: number; y: number } | null>(null)
+  const [circleNotice, setCircleNotice] = useState<string>('')
+  const circleNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const magnifyMapRef = useRef<maplibregl.Map | null>(null)
+  const circleMetricsRef = useRef<Map<string, CircleMetricsData>>(new Map())
+  const circlePollInFlightRef = useRef(false)
 
   const syncDrawnState = useCallback(() => {
     const draw = drawRef.current
@@ -356,6 +456,7 @@ function App() {
   const clearAllAoi = useCallback(() => {
     clearDrawState()
     clearWardSelection()
+    setSelectedAoiCircleId('')
     setExportMessage('')
     lastSubmittedAnalysisKeyRef.current = ''
   }, [clearDrawState, clearWardSelection])
@@ -374,6 +475,7 @@ function App() {
     setDrawnFeatureId('')
     setExportMessage('')
     lastSubmittedAnalysisKeyRef.current = ''
+    setSelectedAoiCircleId('')
     draw.changeMode('draw_polygon')
     setDrawMode('draw_polygon')
 
@@ -428,6 +530,7 @@ function App() {
 
   const removeCircle = useCallback((circleId: string) => {
     setLockedCircles(prev => prev.filter(c => c.id !== circleId))
+    setSelectedAoiCircleId((current) => (current === circleId ? '' : current))
     setCircleMetrics(prev => {
       const updated = new Map(prev)
       updated.delete(circleId)
@@ -437,6 +540,7 @@ function App() {
 
   const clearAllCircles = useCallback(() => {
     setLockedCircles([])
+    setSelectedAoiCircleId('')
     setCircleMetrics(new Map())
 
     const map = mapRef.current
@@ -453,11 +557,47 @@ function App() {
     }
   }, [])
 
+  const showCircleNotice = useCallback((message: string) => {
+    setCircleNotice(message)
+    if (circleNoticeTimerRef.current) {
+      clearTimeout(circleNoticeTimerRef.current)
+    }
+    circleNoticeTimerRef.current = setTimeout(() => {
+      setCircleNotice('')
+      circleNoticeTimerRef.current = null
+    }, 2400)
+  }, [])
+
+  const handleToggleCircleTool = useCallback(() => {
+    const nextActive = !circleToolActive
+    setCircleToolActive(nextActive)
+
+    if (nextActive && drawMode !== 'simple_select') {
+      const draw = drawRef.current
+      if (draw) {
+        draw.changeMode('simple_select')
+        setDrawMode('simple_select')
+      }
+    }
+
+    showCircleNotice(nextActive ? 'Lens mode enabled. Move on map, click to pin, and use a circle as AOI.' : 'Lens mode disabled.')
+  }, [circleToolActive, drawMode, showCircleNotice])
+
   const citiesQuery = useQuery({
     queryKey: ['cities'],
     queryFn: getCities,
   })
   const effectiveCity = selectedCity || citiesQuery.data?.cities?.[0]?.city || ''
+
+  useEffect(() => {
+    if (selectedCity || !citiesQuery.data?.cities?.length) {
+      return
+    }
+    const delhiMatch = citiesQuery.data.cities.find((city) => city.city.trim().toLowerCase() === DEFAULT_CITY_SLUG)
+    if (delhiMatch) {
+      setSelectedCity(delhiMatch.city)
+    }
+  }, [citiesQuery.data?.cities, selectedCity])
 
   const analyzeCircle = useCallback(async (circle: LockedCircle) => {
     // Convert circle to polygon
@@ -466,6 +606,9 @@ function App() {
     // Set loading state
     setCircleMetrics(prev => new Map(prev).set(circle.id, {
       circleId: circle.id,
+      status: 'queued',
+      progressPct: 0,
+      progressMessage: 'Submitting comparison job…',
       isLoading: true,
       metrics: {},
       qualitySummary: {},
@@ -487,20 +630,27 @@ function App() {
           const updated = new Map(prev)
           const existing = updated.get(circle.id)
           if (existing) {
-            updated.set(circle.id, { ...existing, jobId: response.job_id })
+            updated.set(circle.id, {
+              ...existing,
+              jobId: response.job_id,
+              status: 'queued',
+              progressPct: 0,
+              progressMessage: 'Queued. Smaller circles (250m/500m) usually finish faster.',
+            })
           }
           return updated
         })
-
-        // Start polling - we'll handle this with a separate effect
-        setActiveJobId(response.job_id)
       } else {
         // Immediate result
+        const parsedResult = parseCircleResultPayload(response.result as Record<string, unknown>)
         setCircleMetrics(prev => new Map(prev).set(circle.id, {
           circleId: circle.id,
+          status: 'succeeded',
+          progressPct: 100,
+          progressMessage: parsedResult.error || 'Circle analysis complete.',
           isLoading: false,
-          metrics: response.result,
-          qualitySummary: {},
+          metrics: parsedResult.error ? { error: parsedResult.error } : parsedResult.metrics,
+          qualitySummary: parsedResult.qualitySummary,
           location: circle.location,
         }))
       }
@@ -508,6 +658,9 @@ function App() {
       console.error('Circle analysis failed:', error)
       setCircleMetrics(prev => new Map(prev).set(circle.id, {
         circleId: circle.id,
+        status: 'failed',
+        progressPct: 0,
+        progressMessage: 'Circle analysis failed to start.',
         isLoading: false,
         metrics: { error: 'Analysis failed' },
         qualitySummary: {},
@@ -515,6 +668,43 @@ function App() {
       }))
     }
   }, [effectiveCity])
+
+  const pinCircleAt = useCallback((center: [number, number]) => {
+    if (lockedCircles.length >= MAX_COMPARE_CIRCLES) {
+      showCircleNotice(`Comparison is limited to ${MAX_COMPARE_CIRCLES} circles for clarity.`)
+      return
+    }
+
+    clearDrawState()
+    clearWardSelection()
+
+    const circleId = `circle-${Date.now()}`
+    const newCircle: LockedCircle = {
+      id: circleId,
+      center,
+      radius: circleRadius,
+      color: getCircleColor(lockedCircles.length),
+      label: getCircleLabel(lockedCircles.length),
+      location: null,
+      createdAt: Date.now(),
+    }
+
+    setLockedCircles((prev) => [...prev, newCircle])
+    setSelectedAoiCircleId(newCircle.id)
+
+    const map = mapRef.current
+    if (map) {
+      const hoverSource = map.getSource('hover-circle-source') as maplibregl.GeoJSONSource | undefined
+      if (hoverSource) {
+        hoverSource.setData(emptyFeatureCollection())
+      }
+    }
+    setHoverCircleCenter(null)
+    setCursorPosition(null)
+
+    analyzeCircle(newCircle)
+    showCircleNotice(`Pinned ${newCircle.label}. It is now the active AOI and comparison target.`)
+  }, [analyzeCircle, circleRadius, clearDrawState, clearWardSelection, lockedCircles.length, showCircleNotice])
 
   const wardsQuery = useQuery({
     queryKey: ['city-wards', effectiveCity],
@@ -661,9 +851,15 @@ function App() {
   )
 
   const geometryValidation = useMemo(() => validateAndNormalizeGeometry(drawnGeometry), [drawnGeometry])
+  const selectedAoiCircle = useMemo(
+    () => lockedCircles.find((circle) => circle.id === selectedAoiCircleId) ?? null,
+    [lockedCircles, selectedAoiCircleId],
+  )
 
   const currentAoiSource: PanelSourceType = drawnGeometry
     ? 'drawn_polygon'
+    : selectedAoiCircle
+      ? 'circle'
     : selectedWardIds.length > 1
       ? 'selected_wards'
       : effectiveSelectedWardId
@@ -671,8 +867,15 @@ function App() {
         : 'city'
 
   const currentAoiDescription = useMemo(
-    () => describeAoi(currentAoiSource, effectiveCity, selectedWardFeatures as WardGeometryFeature[], geometryValidation.areaSqM ? geometryValidation.areaSqM / 1_000_000 : null),
-    [currentAoiSource, effectiveCity, geometryValidation.areaSqM, selectedWardFeatures],
+    () =>
+      describeAoi(
+        currentAoiSource,
+        effectiveCity,
+        selectedWardFeatures as WardGeometryFeature[],
+        geometryValidation.areaSqM ? geometryValidation.areaSqM / 1_000_000 : null,
+        selectedAoiCircle,
+      ),
+    [currentAoiSource, effectiveCity, geometryValidation.areaSqM, selectedAoiCircle, selectedWardFeatures],
   )
 
   const submitAreaAnalysisMutation = useMutation({
@@ -856,6 +1059,105 @@ function App() {
     }
   }, [activeJob?.status])
 
+  useEffect(() => {
+    circleMetricsRef.current = circleMetrics
+  }, [circleMetrics])
+
+  useEffect(() => {
+    const pollCircleJobs = async () => {
+      if (circlePollInFlightRef.current) {
+        return
+      }
+
+      const pending = Array.from(circleMetricsRef.current.values()).filter((entry) => entry.isLoading && entry.jobId)
+      if (pending.length === 0) {
+        return
+      }
+
+      circlePollInFlightRef.current = true
+      try {
+        const results = await Promise.all(
+          pending.map(async (entry) => {
+            try {
+              const response = await getAnalyseJob(entry.jobId as string)
+              return { circleId: entry.circleId, response }
+            } catch (error) {
+              return {
+                circleId: entry.circleId,
+                error: error instanceof Error ? error.message : 'Unable to refresh circle job status.',
+              }
+            }
+          }),
+        )
+
+        setCircleMetrics((prev) => {
+          const updated = new Map(prev)
+          for (const result of results) {
+            const existing = updated.get(result.circleId)
+            if (!existing) {
+              continue
+            }
+
+            if ('error' in result) {
+              updated.set(result.circleId, {
+                ...existing,
+                progressMessage: result.error,
+              })
+              continue
+            }
+
+            const job = result.response
+            if (job.status === 'succeeded' && job.result) {
+              const parsedResult = parseCircleResultPayload(job.result as Record<string, unknown>)
+              updated.set(result.circleId, {
+                ...existing,
+                isLoading: false,
+                status: 'succeeded',
+                progressPct: 100,
+                progressMessage: parsedResult.error || 'Circle analysis complete.',
+                metrics: parsedResult.error ? { error: parsedResult.error } : parsedResult.metrics,
+                qualitySummary: parsedResult.qualitySummary,
+              })
+              continue
+            }
+
+            if (job.status === 'failed') {
+              updated.set(result.circleId, {
+                ...existing,
+                isLoading: false,
+                status: 'failed',
+                progressPct: job.progress_pct ?? 0,
+                progressMessage: job.error || 'Circle analysis failed.',
+                metrics: { error: job.error || 'Analysis failed' },
+              })
+              continue
+            }
+
+            updated.set(result.circleId, {
+              ...existing,
+              status: job.status,
+              progressPct: job.progress_pct ?? 0,
+              progressMessage: job.progress_message || (job.status === 'queued' ? 'Queued for comparison analysis.' : 'Computing circle metrics...'),
+            })
+          }
+          return updated
+        })
+      } finally {
+        circlePollInFlightRef.current = false
+      }
+    }
+
+    const intervalId = window.setInterval(() => {
+      void pollCircleJobs()
+    }, CIRCLE_POLL_INTERVAL_MS)
+
+    void pollCircleJobs()
+
+    return () => {
+      window.clearInterval(intervalId)
+    }
+  }, [])
+
   // Update locked circles layer when circles change
   useEffect(() => {
     updateLockedCirclesLayer()
@@ -949,6 +1251,32 @@ function App() {
     }
   }, [activeAnalysisKey, activeAnalysisLabel, activeAnalysisSource, activeJob])
 
+  const selectedCircleMetrics = useMemo(
+    () => (selectedAoiCircle ? circleMetrics.get(selectedAoiCircle.id) ?? null : null),
+    [circleMetrics, selectedAoiCircle],
+  )
+
+  const circlePanelData = useMemo<PanelSnapshot | null>(() => {
+    if (!selectedAoiCircle || !selectedCircleMetrics || selectedCircleMetrics.isLoading) {
+      return null
+    }
+    if ('error' in selectedCircleMetrics.metrics) {
+      return null
+    }
+    if (!Object.keys(selectedCircleMetrics.metrics).length) {
+      return null
+    }
+
+    return {
+      sourceType: 'circle',
+      sourceId: selectedAoiCircle.id,
+      title: `Circle ${selectedAoiCircle.label} AOI`,
+      subtitle: selectedAoiCircle.location || `${selectedAoiCircle.center[1].toFixed(4)}, ${selectedAoiCircle.center[0].toFixed(4)}`,
+      metrics: selectedCircleMetrics.metrics,
+      qualitySummary: selectedCircleMetrics.qualitySummary,
+    }
+  }, [selectedAoiCircle, selectedCircleMetrics])
+
   const wardPanelData = useMemo<PanelSnapshot | null>(() => {
     if (!wardDetailsQuery.data?.metrics_json?.all_metrics || !effectiveSelectedWardId) {
       return null
@@ -988,6 +1316,9 @@ function App() {
     if (currentAoiSource === 'city') {
       return cityPanelData
     }
+    if (currentAoiSource === 'circle') {
+      return circlePanelData
+    }
     if (currentAoiSource === 'ward') {
       return wardPanelData
     }
@@ -998,7 +1329,7 @@ function App() {
       return activeCustomPanelData
     }
     return null
-  }, [activeAnalysisSource, activeCustomPanelData, cityPanelData, currentAoiSource, wardPanelData])
+  }, [activeAnalysisSource, activeCustomPanelData, circlePanelData, cityPanelData, currentAoiSource, wardPanelData])
 
   const cityAverageMetricMap = useMemo(() => {
     const map = new Map<string, number>()
@@ -1017,8 +1348,11 @@ function App() {
     if (currentAoiSource === 'city') {
       return `${effectiveCity || 'the city'} overall`
     }
+    if (currentAoiSource === 'circle' && selectedAoiCircle) {
+      return `circle ${selectedAoiCircle.label} AOI`
+    }
     return 'this area of interest'
-  }, [currentAoiSource, effectiveCity])
+  }, [currentAoiSource, effectiveCity, selectedAoiCircle])
 
   const highlightCards = useMemo(
     () => buildHighlightCards(activePanelData?.metrics ?? cityAveragePayload, cityAverageMetricMap, metaMetricsQuery.data?.metrics ?? [], narrativeContext),
@@ -1044,6 +1378,9 @@ function App() {
     if (drawnGeometry) {
       return 'AOI is ready. Edit it or clear it. Results refresh automatically.'
     }
+    if (selectedAoiCircle) {
+      return `Circle ${selectedAoiCircle.label} is the active AOI. Pin another circle or switch to wards/polygon.`
+    }
     if (selectedWardIds.length > 1) {
       return 'Multiple wards are combined and analysed as one AOI automatically.'
     }
@@ -1051,7 +1388,7 @@ function App() {
       return 'Single ward selected. Click more wards to grow the AOI or draw a custom polygon.'
     }
     return 'Click wards to build an AOI or draw a custom polygon.'
-  }, [drawMode, drawnGeometry, geometryValidation.errors, selectedWardIds.length])
+  }, [drawMode, drawnGeometry, geometryValidation.errors, selectedAoiCircle, selectedWardIds.length])
 
   const handleExportJson = useCallback(() => {
     if (!activePanelData || metricPanelRows.length === 0) {
@@ -1060,7 +1397,7 @@ function App() {
     }
 
     const exportSourceType =
-      activePanelData.sourceType === 'selected_wards' || activePanelData.sourceType === 'drawn_polygon'
+      activePanelData.sourceType === 'selected_wards' || activePanelData.sourceType === 'drawn_polygon' || activePanelData.sourceType === 'circle'
         ? 'custom_polygon'
         : activePanelData.sourceType
     const fileName = `urbanmor_${effectiveCity}_${activePanelData.sourceType}_${activePanelData.sourceId}.json`
@@ -1084,7 +1421,7 @@ function App() {
     }
 
     const exportSourceType =
-      activePanelData.sourceType === 'selected_wards' || activePanelData.sourceType === 'drawn_polygon'
+      activePanelData.sourceType === 'selected_wards' || activePanelData.sourceType === 'drawn_polygon' || activePanelData.sourceType === 'circle'
         ? 'custom_polygon'
         : activePanelData.sourceType
     const fileName = `urbanmor_${effectiveCity}_${activePanelData.sourceType}_${activePanelData.sourceId}.csv`
@@ -1323,7 +1660,7 @@ function App() {
           source: 'roads-overlay-source',
           paint: {
             'line-color': '#ea580c',
-            'line-opacity': 0.45,
+            'line-opacity': 0.58,
             'line-width': [
               'interpolate',
               ['linear'],
@@ -1356,7 +1693,7 @@ function App() {
           source: 'wards-source',
           paint: {
             'fill-color': '#d6d3d1',
-            'fill-opacity': 0.22,
+            'fill-opacity': 0.34,
           },
         })
       }
@@ -1367,9 +1704,9 @@ function App() {
           type: 'line',
           source: 'wards-source',
           paint: {
-            'line-color': '#334155',
-            'line-width': 0.9,
-            'line-opacity': 0.45,
+            'line-color': '#0f172a',
+            'line-width': 1.15,
+            'line-opacity': 0.74,
           },
         })
       }
@@ -1564,6 +1901,7 @@ function App() {
       }
 
       setSelectedWardIds((current) => (current.includes(wardId) ? current.filter((item) => item !== wardId) : [...current, wardId]))
+      setSelectedAoiCircleId('')
       setExportMessage('')
     }
 
@@ -1669,15 +2007,73 @@ function App() {
       return
     }
 
-    if (map.getLayer('basemap-street')) {
-      map.setLayoutProperty('basemap-street', 'visibility', basemapMode === 'street' ? 'visible' : 'none')
+    const visibility = showWardLayer ? 'visible' : 'none'
+    const wardLayers = ['wards-fill', 'wards-outline', 'wards-hover', 'wards-selected']
+    for (const layerId of wardLayers) {
+      if (map.getLayer(layerId)) {
+        map.setLayoutProperty(layerId, 'visibility', visibility)
+      }
     }
-    if (map.getLayer('basemap-satellite')) {
-      map.setLayoutProperty('basemap-satellite', 'visibility', basemapMode === 'satellite' ? 'visible' : 'none')
+
+    if (!showWardLayer) {
+      setHoverWardId('')
     }
+  }, [showWardLayer])
+
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) {
+      return
+    }
+
+    for (const layerId of ALL_BASEMAP_LAYER_IDS) {
+      if (map.getLayer(layerId)) {
+        map.setLayoutProperty(layerId, 'visibility', 'none')
+      }
+    }
+    for (const layerId of basemapLayerIdsForPreset(basemapMode)) {
+      if (map.getLayer(layerId)) {
+        map.setLayoutProperty(layerId, 'visibility', 'visible')
+      }
+    }
+
     if (map.getLayer('roads-overlay-line')) {
-      map.setPaintProperty('roads-overlay-line', 'line-color', basemapMode === 'satellite' ? '#fef3c7' : '#ea580c')
-      map.setPaintProperty('roads-overlay-line', 'line-opacity', basemapMode === 'satellite' ? 0.72 : 0.42)
+      if (isImageryBasemapPreset(basemapMode)) {
+        map.setPaintProperty('roads-overlay-line', 'line-color', '#fef3c7')
+        map.setPaintProperty('roads-overlay-line', 'line-opacity', 0.82)
+      } else if (isDarkBasemapPreset(basemapMode)) {
+        map.setPaintProperty('roads-overlay-line', 'line-color', '#fdba74')
+        map.setPaintProperty('roads-overlay-line', 'line-opacity', 0.72)
+      } else {
+        map.setPaintProperty('roads-overlay-line', 'line-color', '#ea580c')
+        map.setPaintProperty('roads-overlay-line', 'line-opacity', 0.56)
+      }
+    }
+
+    if (map.getLayer('wards-outline')) {
+      map.setPaintProperty('wards-outline', 'line-color', isDarkBasemapPreset(basemapMode) ? '#e2e8f0' : '#0f172a')
+      map.setPaintProperty('wards-outline', 'line-opacity', isDarkBasemapPreset(basemapMode) ? 0.62 : 0.74)
+    }
+    if (map.getLayer('wards-selected')) {
+      map.setPaintProperty('wards-selected', 'line-color', isDarkBasemapPreset(basemapMode) ? '#5eead4' : '#0f766e')
+    }
+  }, [basemapMode])
+
+  useEffect(() => {
+    const magnifyMap = magnifyMapRef.current
+    if (!magnifyMap) {
+      return
+    }
+
+    for (const layerId of ALL_BASEMAP_LAYER_IDS) {
+      if (magnifyMap.getLayer(layerId)) {
+        magnifyMap.setLayoutProperty(layerId, 'visibility', 'none')
+      }
+    }
+    for (const layerId of basemapLayerIdsForPreset(basemapMode)) {
+      if (magnifyMap.getLayer(layerId)) {
+        magnifyMap.setLayoutProperty(layerId, 'visibility', 'visible')
+      }
     }
   }, [basemapMode])
 
@@ -1712,7 +2108,7 @@ function App() {
     }
 
     const isLocked = isDrawInteractionMode(drawMode)
-    map.setPaintProperty('wards-fill', 'fill-opacity', isLocked ? 0.12 : 0.22)
+    map.setPaintProperty('wards-fill', 'fill-opacity', isLocked ? 0.22 : 0.34)
     map.getCanvas().style.cursor = isLocked ? 'crosshair' : ''
   }, [drawMode])
 
@@ -1725,6 +2121,8 @@ function App() {
       if (hoverSource) {
         hoverSource.setData(emptyFeatureCollection())
       }
+      setHoverCircleCenter(null)
+      setCursorPosition(null)
       return
     }
 
@@ -1739,10 +2137,8 @@ function App() {
       lastUpdateTime = now
 
       const { lng, lat } = event.lngLat
-
-      // Update hover circle center and cursor position for magnifying lens
       setHoverCircleCenter([lng, lat])
-      setCursorPosition({ x: event.originalEvent.clientX, y: event.originalEvent.clientY })
+      setCursorPosition({ x: event.point.x, y: event.point.y })
 
       // Update hover circle source
       const polygon = createCirclePolygon([lng, lat], circleRadius)
@@ -1755,25 +2151,31 @@ function App() {
         })
       }
 
-      // Update magnifying lens position if it exists
       if (magnifyMapRef.current) {
-        const magnifyZoom = Math.min(map.getZoom() + 3, 19)
         magnifyMapRef.current.setCenter([lng, lat])
-        magnifyMapRef.current.setZoom(magnifyZoom)
+        magnifyMapRef.current.setZoom(Math.min(map.getZoom() + 3, 19))
       }
     }
 
+    const handleMouseLeave = () => {
+      const source = map.getSource('hover-circle-source') as maplibregl.GeoJSONSource | undefined
+      if (source) {
+        source.setData(emptyFeatureCollection())
+      }
+      setHoverCircleCenter(null)
+      setCursorPosition(null)
+    }
+
     map.on('mousemove', handleMouseMove)
+    map.on('mouseleave', handleMouseLeave)
     map.getCanvas().style.cursor = 'crosshair'
 
     return () => {
       map.off('mousemove', handleMouseMove)
+      map.off('mouseleave', handleMouseLeave)
       if (!isDrawInteractionMode(drawMode)) {
         map.getCanvas().style.cursor = ''
       }
-      // Clear hover states on cleanup
-      setHoverCircleCenter(null)
-      setCursorPosition(null)
     }
   }, [circleToolActive, circleRadius, drawMode])
 
@@ -1784,39 +2186,9 @@ function App() {
       return
     }
 
-    const handleMapClick = async (event: MapMouseEvent) => {
-      // Check if we already have max circles
-      if (lockedCircles.length >= 4) {
-        alert('Maximum 4 circles reached. Remove a circle to add a new one.')
-        return
-      }
-
+    const handleMapClick = (event: MapMouseEvent) => {
       const { lng, lat } = event.lngLat
-
-      // Create locked circle
-      const circleId = `circle-${Date.now()}`
-      const newCircle: LockedCircle = {
-        id: circleId,
-        center: [lng, lat],
-        radius: circleRadius,
-        color: getCircleColor(lockedCircles.length),
-        label: getCircleLabel(lockedCircles.length),
-        location: null,
-        createdAt: Date.now(),
-      }
-
-      setLockedCircles(prev => [...prev, newCircle])
-
-      // Clear hover circle and lens
-      const hoverSource = map.getSource('hover-circle-source') as maplibregl.GeoJSONSource
-      if (hoverSource) {
-        hoverSource.setData(emptyFeatureCollection())
-      }
-      setHoverCircleCenter(null)
-      setCursorPosition(null)
-
-      // Start async analysis
-      analyzeCircle(newCircle)
+      pinCircleAt([lng, lat])
     }
 
     map.on('click', handleMapClick)
@@ -1824,15 +2196,26 @@ function App() {
     return () => {
       map.off('click', handleMapClick)
     }
-  }, [circleToolActive, circleRadius, lockedCircles, analyzeCircle])
+  }, [circleToolActive, pinCircleAt])
 
-  // Cleanup magnifying map when circle tool is disabled
   useEffect(() => {
     if (!circleToolActive && magnifyMapRef.current) {
       magnifyMapRef.current.remove()
       magnifyMapRef.current = null
     }
   }, [circleToolActive])
+
+  useEffect(() => {
+    return () => {
+      if (circleNoticeTimerRef.current) {
+        clearTimeout(circleNoticeTimerRef.current)
+      }
+      if (magnifyMapRef.current) {
+        magnifyMapRef.current.remove()
+        magnifyMapRef.current = null
+      }
+    }
+  }, [])
 
   useEffect(() => {
     if (!effectiveCity) {
@@ -1852,6 +2235,13 @@ function App() {
     })
   }, [effectiveCity, wardsGeoQuery.data])
 
+  useEffect(() => {
+    if (isSidebarOpen) {
+      setShowMapGuide(false)
+      setShowMapPreview(true)
+    }
+  }, [isSidebarOpen])
+
   const cityError = citiesQuery.error instanceof Error ? citiesQuery.error.message : ''
   const wardError = wardsQuery.error instanceof Error ? wardsQuery.error.message : ''
   const metricError = cityWardsMetricsQuery.error instanceof Error ? cityWardsMetricsQuery.error.message : ''
@@ -1867,17 +2257,26 @@ function App() {
 
   return (
     <div className="urbanmor-shell h-screen w-screen text-slate-900">
-      <div className="grid h-full grid-cols-12 gap-3 p-3">
-        <aside className="urbanmor-sidebar col-span-12 overflow-y-auto rounded-[28px] p-4 md:col-span-4 lg:col-span-3">
-          <div className="urbanmor-masthead rounded-[24px] p-4 text-white">
+      <div className="grid h-full grid-cols-12 gap-2 p-2">
+        <aside className={`urbanmor-sidebar overflow-y-auto rounded-[28px] p-3 ${isSidebarOpen ? 'col-span-12 md:col-span-4 lg:col-span-3' : 'hidden'}`}>
+          <div className="mb-2 flex justify-end">
+            <button
+              type="button"
+              className="rounded-full border border-stone-300 bg-white px-3 py-1 text-[11px] font-semibold text-slate-700 transition hover:bg-stone-50"
+              onClick={() => setIsSidebarOpen(false)}
+            >
+              Close Sidebar
+            </button>
+          </div>
+          <div className="urbanmor-masthead rounded-[24px] p-3 text-white">
             <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-amber-100">UrbanMorph</p>
-            <h1 className="mt-2 text-4xl leading-none">Area-first urban diagnostics</h1>
-            <p className="mt-3 max-w-xs text-sm text-slate-100/90">
+            <h1 className="mt-2 text-[2.15rem] leading-[1.02]">Area-first urban diagnostics</h1>
+            <p className="mt-3 max-w-xs text-[13px] leading-5 text-slate-100/90">
               Pick a city, click wards to build an area of interest, or draw a polygon. Results update automatically.
             </p>
           </div>
 
-          <section className="mt-4 rounded-[24px] border border-stone-200 bg-white/95 p-4 shadow-sm">
+          <section className="mt-3 rounded-[24px] border border-stone-200 bg-white/95 p-3 shadow-sm">
             <label className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">City</label>
             <select
               className="mt-2 w-full rounded-2xl border border-stone-300 bg-white px-3 py-3 text-sm outline-none transition focus:border-cyan-600 focus:ring-2 focus:ring-cyan-100"
@@ -1905,7 +2304,7 @@ function App() {
             ) : null}
           </section>
 
-          <section className="mt-4 rounded-[24px] border border-stone-200 bg-white/95 p-4 shadow-sm">
+          <section className="mt-3 rounded-[24px] border border-stone-200 bg-white/95 p-3 shadow-sm">
             <div className="flex items-start justify-between gap-3">
               <div>
                 <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Area Of Interest</p>
@@ -1945,47 +2344,80 @@ function App() {
               </button>
             </div>
 
-            <div className="mt-3 flex flex-wrap items-center gap-2">
+            <div className="mt-3 rounded-[18px] border border-amber-200 bg-gradient-to-r from-amber-50 to-orange-50 p-2.5">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-800">Lens Mode</p>
+                  <p className="mt-1 text-[11px] leading-5 text-amber-900/80">
+                    {circleToolActive
+                      ? `Preview follows cursor. Click to pin up to ${MAX_COMPARE_CIRCLES} circles. Any pinned circle can become the active AOI.`
+                      : drawGuidance}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className={`rounded-full border px-3 py-1 text-[10px] font-semibold transition ${
+                    circleToolActive
+                      ? 'border-amber-700 bg-amber-700 text-white hover:bg-amber-800'
+                      : 'border-amber-300 bg-white text-amber-800 hover:bg-amber-100'
+                  }`}
+                  onClick={handleToggleCircleTool}
+                >
+                  {circleToolActive ? 'Lens On' : 'Lens Off'}
+                </button>
+              </div>
+
+              <div className="mt-3 grid grid-cols-4 gap-1">
+                {CIRCLE_RADIUS_OPTIONS.map((radius) => (
+                  <button
+                    key={radius}
+                    type="button"
+                    disabled={!circleToolActive}
+                    onClick={() => setCircleRadius(radius)}
+                    className={`rounded-xl px-2 py-1.5 text-[11px] font-semibold transition ${
+                      circleRadius === radius
+                        ? 'bg-slate-900 text-white shadow-sm'
+                        : 'bg-white/85 text-slate-700 hover:bg-white'
+                    } disabled:cursor-not-allowed disabled:opacity-45`}
+                  >
+                    {formatCircleRadius(radius)}
+                  </button>
+                ))}
+              </div>
+
               <button
                 type="button"
-                className={`rounded-full px-4 py-2 text-xs font-semibold transition ${
-                  circleToolActive
-                    ? 'bg-amber-600 text-white hover:bg-amber-700'
-                    : 'border border-stone-300 bg-white text-slate-700 hover:bg-stone-50'
-                }`}
+                className="mt-2 w-full rounded-xl border border-cyan-300 bg-cyan-50 px-3 py-1.5 text-[11px] font-semibold text-cyan-900 transition hover:bg-cyan-100 disabled:cursor-not-allowed disabled:opacity-45"
+                disabled={!circleToolActive || !hoverCircleCenter}
                 onClick={() => {
-                  setCircleToolActive(!circleToolActive)
-                  if (!circleToolActive && drawMode !== 'simple_select') {
-                    // Deactivate polygon draw if active
-                    const draw = drawRef.current
-                    if (draw) {
-                      draw.changeMode('simple_select')
-                      setDrawMode('simple_select')
-                    }
+                  if (!hoverCircleCenter) {
+                    showCircleNotice('Move the cursor over the map, then tap Set AOI from Lens.')
+                    return
                   }
+                  pinCircleAt(hoverCircleCenter)
                 }}
               >
-                🔍 Circle Tool
+                Set AOI from Lens
               </button>
-              {circleToolActive && (
-                <select
-                  value={circleRadius}
-                  onChange={(e) => setCircleRadius(Number(e.target.value))}
-                  className="rounded-full border border-amber-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 outline-none transition focus:border-amber-600 focus:ring-2 focus:ring-amber-100"
-                >
-                  <option value={250}>250m radius</option>
-                  <option value={500}>500m radius</option>
-                  <option value={1000}>1km radius</option>
-                  <option value={2000}>2km radius</option>
-                </select>
-              )}
+
+              <div className="mt-3 flex items-center justify-between gap-2 text-[10px] text-slate-600">
+                <span className="rounded-full border border-amber-200 bg-white/70 px-2 py-1">
+                  Radius: <span className="font-semibold text-slate-900">{formatCircleRadius(circleRadius)}</span>
+                </span>
+                <span className="rounded-full border border-amber-200 bg-white/70 px-2 py-1">
+                  Pinned: <span className="font-semibold text-slate-900">{lockedCircles.length}/{MAX_COMPARE_CIRCLES}</span>
+                </span>
+              </div>
+              <p className="mt-2 text-[10px] text-slate-600">
+                AOI Circle: <span className="font-semibold text-slate-900">{selectedAoiCircle?.label ?? 'None'}</span> · Smaller circles usually analyse faster.
+              </p>
             </div>
 
-            <p className="mt-3 rounded-2xl border border-cyan-100 bg-cyan-50 px-3 py-2 text-sm text-cyan-900">
-              {circleToolActive
-                ? '🔍 Circle tool active: Move cursor to preview, click to lock a circle for analysis (max 4).'
-                : drawGuidance}
-            </p>
+            {circleNotice ? (
+              <p className="mt-3 rounded-2xl border border-cyan-100 bg-cyan-50 px-3 py-2 text-xs font-medium text-cyan-900">
+                {circleNotice}
+              </p>
+            ) : null}
 
             {geometryValidation.errors.length > 0 ? (
               <div className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 p-3 text-[11px] text-rose-700">
@@ -2009,7 +2441,7 @@ function App() {
               </div>
             ) : null}
 
-            {activeJobId ? (
+            {activeJobId && currentAoiSource !== 'circle' ? (
               <div className="mt-4 rounded-[22px] border border-stone-200 bg-stone-50 p-3 text-sm text-slate-700">
                 <div className="flex items-center justify-between gap-2">
                   <p className="font-semibold text-slate-900">Analysing: {activeAnalysisLabel || 'AOI'}</p>
@@ -2026,14 +2458,29 @@ function App() {
                 {activeJob?.error ? <p className="mt-2 text-[11px] text-rose-700">{activeJob.error}</p> : null}
               </div>
             ) : null}
+
+            {currentAoiSource === 'circle' && selectedAoiCircle && selectedCircleMetrics?.isLoading ? (
+              <div className="mt-4 rounded-[22px] border border-amber-200 bg-amber-50 p-3 text-[11px] text-amber-900">
+                <p className="font-semibold">Analysing Circle {selectedAoiCircle.label} AOI…</p>
+                <p className="mt-1 text-amber-800/90">
+                  {selectedCircleMetrics.progressMessage || 'Running circle analysis.'}
+                </p>
+              </div>
+            ) : null}
+
+            {currentAoiSource === 'circle' && selectedCircleMetrics?.metrics?.error ? (
+              <div className="mt-4 rounded-[22px] border border-rose-200 bg-rose-50 p-3 text-[11px] text-rose-700">
+                {typeof selectedCircleMetrics.metrics.error === 'string' ? selectedCircleMetrics.metrics.error : 'Circle AOI analysis failed.'}
+              </div>
+            ) : null}
           </section>
 
           {lockedCircles.length > 0 && (
-            <section className="mt-4 rounded-[24px] border border-amber-200 bg-amber-50/50 p-4 shadow-sm">
+            <section className="mt-3 rounded-[24px] border border-amber-200/80 bg-gradient-to-b from-amber-50/80 to-white p-3 shadow-sm">
               <div className="flex items-center justify-between gap-3">
                 <div>
                   <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-amber-700">Circle Analysis</p>
-                  <h2 className="mt-1 text-xl text-slate-900">Neighborhood comparisons</h2>
+                  <h2 className="mt-1 text-lg text-slate-900">{lockedCircles.length}-point comparison</h2>
                 </div>
                 <button
                   type="button"
@@ -2051,11 +2498,11 @@ function App() {
                   return (
                     <article
                       key={circle.id}
-                      className="rounded-[22px] border-2 bg-white p-4"
+                      className="rounded-[18px] border bg-white/95 p-3 shadow-[0_8px_24px_rgba(15,23,42,0.08)] transition hover:shadow-[0_12px_28px_rgba(15,23,42,0.12)]"
                       style={{ borderColor: circle.color }}
                     >
                       <div className="flex items-start justify-between gap-3">
-                        <div className="flex-1">
+                        <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-2">
                             <span
                               className="flex h-6 w-6 items-center justify-center rounded-full text-xs font-bold text-white"
@@ -2067,44 +2514,72 @@ function App() {
                               Location {circle.label}
                             </p>
                           </div>
-                          <p className="mt-2 text-xs text-slate-600">
-                            📍 {circle.location || `${circle.center[1].toFixed(4)}, ${circle.center[0].toFixed(4)}`}
+                          <p className="mt-2 truncate text-[11px] text-slate-600" title={circle.location || `${circle.center[1].toFixed(4)}, ${circle.center[0].toFixed(4)}`}>
+                            {circle.location || `${circle.center[1].toFixed(4)}, ${circle.center[0].toFixed(4)}`}
                           </p>
-                          <p className="mt-1 text-xs text-slate-500">
-                            Radius: {circle.radius}m · Area: {((Math.PI * circle.radius * circle.radius) / 1_000_000).toFixed(3)} km²
+                          <p className="mt-1 text-[11px] text-slate-500">
+                            Radius: {formatCircleRadius(circle.radius)} · Area: {((Math.PI * circle.radius * circle.radius) / 1_000_000).toFixed(3)} km²
                           </p>
                         </div>
-                        <button
-                          type="button"
-                          className="text-slate-400 transition hover:text-red-500"
-                          onClick={() => removeCircle(circle.id)}
-                        >
-                          <span className="text-xl">×</span>
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            className={`rounded-full border px-2.5 py-1 text-[10px] font-semibold transition ${
+                              selectedAoiCircleId === circle.id
+                                ? 'border-cyan-300 bg-cyan-100 text-cyan-900'
+                                : 'border-stone-300 bg-white text-slate-700 hover:bg-stone-50'
+                            }`}
+                            onClick={() => setSelectedAoiCircleId(circle.id)}
+                          >
+                            {selectedAoiCircleId === circle.id ? 'AOI' : 'Use as AOI'}
+                          </button>
+                          <button
+                            type="button"
+                            className="rounded-full border border-stone-200 px-2 text-slate-400 transition hover:border-rose-300 hover:text-rose-600"
+                            onClick={() => removeCircle(circle.id)}
+                          >
+                            <span className="text-xl">×</span>
+                          </button>
+                        </div>
                       </div>
 
                       {metrics?.isLoading ? (
                         <div className="mt-3 rounded-2xl border border-stone-200 bg-stone-50 p-3 text-xs text-slate-500">
-                          <div className="flex items-center gap-2">
-                            <div className="h-4 w-4 animate-spin rounded-full border-2 border-slate-300 border-t-slate-600" />
-                            <span>Calculating metrics...</span>
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="rounded-full border border-stone-300 bg-white px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-600">
+                              {metrics.status === 'queued' ? 'Queued' : 'Running'}
+                            </span>
+                            <span className="font-semibold text-slate-700">{Math.max(0, Math.round(metrics.progressPct ?? 0))}%</span>
                           </div>
+                          <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-stone-200">
+                            <div
+                              className="h-full rounded-full bg-amber-500 transition-all duration-500"
+                              style={{ width: `${Math.min(100, Math.max(8, metrics.progressPct ?? 8))}%` }}
+                            />
+                          </div>
+                          <p className="mt-2 text-[11px] text-slate-600">
+                            {metrics.progressMessage || (metrics.status === 'queued' ? 'Queued for comparison analysis.' : 'Computing circle metrics...')}
+                          </p>
+                        </div>
+                      ) : metrics?.metrics?.error ? (
+                        <div className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700">
+                          {typeof metrics.metrics.error === 'string' ? metrics.metrics.error : 'Analysis failed. Please try again.'}
                         </div>
                       ) : metrics?.metrics && Object.keys(metrics.metrics).length > 0 ? (
                         <div className="mt-3 space-y-2">
                           {buildMetricPanelRows(metrics.metrics, metaMetricsQuery.data?.metrics ?? []).slice(0, 8).map((row) => (
-                            <div key={row.metric_id} className="flex justify-between rounded-2xl border border-stone-200 bg-stone-50 px-3 py-2">
-                              <span className="text-xs text-slate-600">{row.label}</span>
-                              <span className="text-xs font-semibold text-slate-900">
+                            <div key={row.metric_id} className="flex min-w-0 items-center justify-between gap-2 rounded-2xl border border-stone-200 bg-stone-50 px-3 py-2">
+                              <span className="min-w-0 flex-1 truncate text-[11px] text-slate-600" title={row.label}>{row.label}</span>
+                              <span className="max-w-[58%] truncate text-[11px] font-semibold text-slate-900 text-right" title={`${row.valueDisplay}${row.unit ? ` ${row.unit}` : ''}`}>
                                 {row.valueDisplay}
                                 {row.unit && <span className="ml-1 font-normal text-slate-500">{row.unit}</span>}
                               </span>
                             </div>
                           ))}
                         </div>
-                      ) : metrics?.metrics?.error ? (
-                        <div className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700">
-                          Analysis failed. Please try again.
+                      ) : metrics ? (
+                        <div className="mt-3 rounded-2xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
+                          Circle result returned without metric rows.
                         </div>
                       ) : null}
                     </article>
@@ -2114,11 +2589,11 @@ function App() {
             </section>
           )}
 
-          <section className="mt-4 rounded-[24px] border border-stone-200 bg-white/95 p-4 shadow-sm">
+          <section className="mt-3 rounded-[24px] border border-stone-200 bg-white/95 p-3 shadow-sm">
             <div className="flex items-center justify-between gap-3">
               <div>
-                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Key Insights</p>
-                <h2 className="mt-1 text-xl text-slate-900">Four non-overlapping reads</h2>
+                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Preview Metrics</p>
+                <h2 className="mt-1 text-xl text-slate-900">CNR · Block Size · Building Footprint · Open Spaces</h2>
               </div>
               <span className="rounded-full border border-stone-200 bg-stone-50 px-3 py-1 text-[11px] text-slate-500">
                 {currentAoiSource === 'city' ? 'City baseline' : 'AOI result'}
@@ -2146,7 +2621,7 @@ function App() {
             </div>
           </section>
 
-          <details className="mt-4 rounded-[24px] border border-stone-200 bg-white/95 p-4 shadow-sm">
+          <details className="mt-3 rounded-[24px] border border-stone-200 bg-white/95 p-3 shadow-sm">
             <summary className="cursor-pointer list-none text-sm font-semibold text-slate-900">
               Drill Down: full metrics and downloads
             </summary>
@@ -2155,9 +2630,19 @@ function App() {
             </p>
 
             {!activePanelData ? (
-              <p className="mt-4 rounded-2xl border border-stone-200 bg-stone-50 p-3 text-sm text-slate-600">
-                Loading full city metrics. You can still select wards or draw a polygon for a custom AOI.
-              </p>
+              currentAoiSource === 'circle' && selectedAoiCircle ? (
+                <p className="mt-4 rounded-2xl border border-stone-200 bg-stone-50 p-3 text-sm text-slate-600">
+                  {selectedCircleMetrics?.isLoading
+                    ? `Circle ${selectedAoiCircle.label} is being analysed. Full metric export will unlock when it completes.`
+                    : selectedCircleMetrics?.metrics?.error
+                      ? 'Circle AOI analysis failed. Pin another circle or retry.'
+                      : `Select or pin a circle to load full AOI metrics for Circle ${selectedAoiCircle.label}.`}
+                </p>
+              ) : (
+                <p className="mt-4 rounded-2xl border border-stone-200 bg-stone-50 p-3 text-sm text-slate-600">
+                  Loading full city metrics. You can still select wards, use a lens circle, or draw a polygon for a custom AOI.
+                </p>
+              )
             ) : (
               <>
                 <div className="mt-4 rounded-[22px] border border-stone-200 bg-stone-50 p-3 text-sm text-slate-700">
@@ -2207,7 +2692,7 @@ function App() {
           </details>
 
           {cityError || wardError || metricError || cityAverageError || fullMetricError || roadLayerError || transitLayerError ? (
-            <section className="mt-4 rounded-2xl border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">
+            <section className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">
               {cityError ? <p>{cityError}</p> : null}
               {wardError ? <p>{wardError}</p> : null}
               {metricError ? <p>{metricError}</p> : null}
@@ -2219,110 +2704,130 @@ function App() {
           ) : null}
         </aside>
 
-        <main className="urbanmor-mapframe col-span-12 overflow-hidden rounded-[30px] md:col-span-8 lg:col-span-9">
+        <main className={`urbanmor-mapframe overflow-hidden rounded-[30px] ${isSidebarOpen ? 'col-span-12 md:col-span-8 lg:col-span-9' : 'col-span-12'}`}>
           <div className="relative h-full w-full">
             <div ref={mapContainerRef} className="h-full w-full" />
 
-            {/* Magnifying Lens Overlay */}
-            {circleToolActive && hoverCircleCenter && cursorPosition && (
+            {circleToolActive ? (
               <div
-                className="absolute pointer-events-none"
+                className="absolute pointer-events-none transition-opacity duration-100"
                 style={{
-                  left: `${cursorPosition.x}px`,
-                  top: `${cursorPosition.y}px`,
-                  transform: 'translate(-100px, -100px)', // Center the 200px lens on cursor
-                  zIndex: 1000
+                  left: `${(cursorPosition?.x ?? -9999) + 18}px`,
+                  top: `${(cursorPosition?.y ?? -9999) - 18}px`,
+                  transform: 'translate(0, -100%)',
+                  opacity: cursorPosition && hoverCircleCenter ? 1 : 0,
+                  zIndex: 1000,
                 }}
               >
-                <div
-                  style={{
-                    width: '200px',
-                    height: '200px',
-                    borderRadius: '50%',
-                    overflow: 'hidden',
-                    border: '3px solid #D97706',
-                    boxShadow: '0 0 0 2px rgba(217, 119, 6, 0.3), 0 8px 24px rgba(0, 0, 0, 0.6)',
-                    position: 'relative'
-                  }}
-                >
+                <div className="um-lens-shell">
                   <div
                     ref={(el) => {
-                      if (!el || magnifyMapRef.current) return
+                      if (!el || magnifyMapRef.current) {
+                        return
+                      }
 
-                      // Initialize magnifying map
+                      const initialCenter =
+                        hoverCircleCenter ??
+                        ((mapRef.current?.getCenter().toArray() as [number, number] | undefined) ?? [78.9629, 20.5937])
+
                       const magnifyMap = new maplibregl.Map({
                         container: el,
                         style: createBasemapStyle(),
-                        center: hoverCircleCenter,
-                        zoom: Math.min((mapRef.current?.getZoom() || 10) + 3, 19),
+                        center: initialCenter,
+                        zoom: Math.min((mapRef.current?.getZoom() ?? 10) + 3, 19),
                         interactive: false,
-                        attributionControl: false
+                        attributionControl: false,
+                      })
+
+                      magnifyMap.on('load', () => {
+                        for (const layerId of ALL_BASEMAP_LAYER_IDS) {
+                          if (magnifyMap.getLayer(layerId)) {
+                            magnifyMap.setLayoutProperty(layerId, 'visibility', 'none')
+                          }
+                        }
+                        for (const layerId of basemapLayerIdsForPreset(basemapMode)) {
+                          if (magnifyMap.getLayer(layerId)) {
+                            magnifyMap.setLayoutProperty(layerId, 'visibility', 'visible')
+                          }
+                        }
                       })
 
                       magnifyMapRef.current = magnifyMap
                     }}
-                    style={{ width: '100%', height: '100%' }}
+                    className="h-full w-full"
                   />
-
-                  {/* Lens gloss effect */}
-                  <div
-                    style={{
-                      position: 'absolute',
-                      top: '-3px',
-                      left: '-3px',
-                      right: '-3px',
-                      bottom: '-3px',
-                      borderRadius: '50%',
-                      background: 'linear-gradient(135deg, rgba(255,255,255,0.3) 0%, transparent 50%, rgba(0,0,0,0.2) 100%)',
-                      pointerEvents: 'none'
-                    }}
-                  />
-
-                  {/* Center crosshair */}
-                  <div
-                    style={{
-                      position: 'absolute',
-                      left: '50%',
-                      top: '50%',
-                      transform: 'translate(-50%, -50%)',
-                      pointerEvents: 'none'
-                    }}
-                  >
-                    <div style={{ position: 'absolute', width: '20px', height: '2px', background: '#D97706', left: '-10px', top: '-1px', opacity: 0.8 }} />
-                    <div style={{ position: 'absolute', width: '2px', height: '20px', background: '#D97706', left: '-1px', top: '-10px', opacity: 0.8 }} />
+                  <div className="um-lens-gloss" />
+                  <div className="um-lens-crosshair">
+                    <div className="um-lens-crosshair-h" />
+                    <div className="um-lens-crosshair-v" />
                   </div>
                 </div>
               </div>
-            )}
+            ) : null}
 
-            <div className="absolute left-4 top-4 z-10 max-w-sm rounded-[22px] border border-white/70 bg-white/92 p-4 shadow-lg backdrop-blur pointer-events-none">
-              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">How to use</p>
-              <p className="mt-2 text-sm leading-6 text-slate-700">
-                Click wards to add or remove them from the AOI. Draw a polygon when the area does not align to administrative boundaries.
-                Analysis starts as soon as the shape is finished.
-              </p>
+            <div className="absolute left-4 top-4 z-20 flex items-center gap-2">
+              <button
+                type="button"
+                className="rounded-full border border-white/70 bg-white/95 px-4 py-2 text-xs font-semibold text-slate-800 shadow-lg transition hover:bg-white"
+                onClick={() => setIsSidebarOpen((current) => !current)}
+              >
+                {isSidebarOpen ? 'Hide sidebar' : 'Show sidebar'}
+              </button>
+              {!isSidebarOpen ? (
+                <button
+                  type="button"
+                  className={`rounded-full border px-4 py-2 text-xs font-semibold shadow-lg transition ${
+                    showMapGuide
+                      ? 'border-cyan-300 bg-cyan-100 text-cyan-900 hover:bg-cyan-200'
+                      : 'border-white/70 bg-white/95 text-slate-700 hover:bg-white'
+                  }`}
+                  onClick={() => setShowMapGuide((current) => !current)}
+                >
+                  {showMapGuide ? 'Hide guide' : 'Guide'}
+                </button>
+              ) : null}
             </div>
 
-            <div className="absolute right-4 top-4 z-10 w-[18rem] rounded-[24px] border border-white/70 bg-white/92 p-4 shadow-lg backdrop-blur">
+            {showMapGuide ? (
+              <div className="absolute left-4 top-16 z-10 max-w-sm rounded-[22px] border border-white/70 bg-white/92 p-3 shadow-lg backdrop-blur pointer-events-none">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">How to use</p>
+                <p className="mt-2 text-[13px] leading-5 text-slate-700">
+                  Click wards to add or remove them from the AOI. Draw a polygon when the area does not align to administrative boundaries.
+                  Analysis starts as soon as the shape is finished.
+                </p>
+              </div>
+            ) : null}
+
+            <div className="absolute right-4 top-4 z-10 w-[17rem] rounded-[24px] border border-white/75 bg-white/86 p-3 shadow-lg backdrop-blur-md">
               <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Map view</p>
-              <div className="mt-3 flex rounded-full bg-stone-100 p-1 text-xs font-semibold text-slate-600">
-                <button
-                  type="button"
-                  className={`flex-1 rounded-full px-3 py-2 transition ${basemapMode === 'street' ? 'bg-white text-slate-950 shadow-sm' : ''}`}
-                  onClick={() => setBasemapMode('street')}
-                >
-                  Street
-                </button>
-                <button
-                  type="button"
-                  className={`flex-1 rounded-full px-3 py-2 transition ${basemapMode === 'satellite' ? 'bg-white text-slate-950 shadow-sm' : ''}`}
-                  onClick={() => setBasemapMode('satellite')}
-                >
-                  Satellite
-                </button>
+              <p className="mt-2 text-[10px] text-slate-500">Curated styles optimized for AOI and ward overlays</p>
+              <div className="mt-3 grid grid-cols-2 gap-2">
+                {BASEMAP_PRESETS.map((preset) => (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    className={`rounded-2xl border px-2.5 py-2 text-left transition ${
+                      basemapMode === preset.id
+                        ? 'border-cyan-300 bg-cyan-50 text-cyan-900'
+                        : 'border-stone-300 bg-white text-slate-700 hover:bg-stone-50'
+                    }`}
+                    onClick={() => setBasemapMode(preset.id)}
+                  >
+                    <p className="text-[11px] font-semibold leading-4">{preset.label}</p>
+                    <p className="mt-0.5 text-[10px] text-slate-500">{preset.hint}</p>
+                  </button>
+                ))}
               </div>
 
-              <div className="mt-4 grid grid-cols-2 gap-2">
+              <p className="mt-4 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Layer control</p>
+              <div className="mt-2 grid grid-cols-3 gap-2">
+                <button
+                  type="button"
+                  className={`rounded-2xl border px-3 py-2 text-xs font-semibold transition ${showWardLayer ? 'border-teal-300 bg-teal-50 text-teal-900' : 'border-stone-300 bg-white text-slate-600'}`}
+                  onClick={() => setShowWardLayer((current) => !current)}
+                >
+                  {showWardLayer ? 'Wards on' : 'Wards off'}
+                </button>
                 <button
                   type="button"
                   className={`rounded-2xl border px-3 py-2 text-xs font-semibold transition ${showRoadOverlay ? 'border-amber-300 bg-amber-50 text-amber-900' : 'border-stone-300 bg-white text-slate-600'}`}
@@ -2338,11 +2843,25 @@ function App() {
                   {showTransitOverlay ? 'Transit on' : 'Transit off'}
                 </button>
               </div>
+              <button
+                type="button"
+                className={`mt-2 w-full rounded-2xl border px-3 py-2 text-xs font-semibold transition ${
+                  circleToolActive
+                    ? 'border-amber-400 bg-amber-100 text-amber-900'
+                    : 'border-stone-300 bg-white text-slate-700 hover:bg-stone-50'
+                }`}
+                onClick={handleToggleCircleTool}
+              >
+                {circleToolActive ? 'Lens cursor on' : 'Lens cursor off'}
+              </button>
 
               <label className="mt-4 block text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Ward shading</label>
               <select
-                className="mt-2 w-full rounded-2xl border border-stone-300 bg-white px-3 py-3 text-sm outline-none transition focus:border-cyan-600 focus:ring-2 focus:ring-cyan-100"
+                className={`mt-2 w-full rounded-2xl border border-stone-300 px-3 py-3 text-sm outline-none transition focus:border-cyan-600 focus:ring-2 focus:ring-cyan-100 ${
+                  showWardLayer ? 'bg-white' : 'cursor-not-allowed bg-stone-100 text-slate-500'
+                }`}
                 value={effectiveMetricId}
+                disabled={!showWardLayer}
                 onChange={(event) => setActiveMetricId(event.target.value)}
               >
                 {mapMetricOptions.map((metric: MetricMetaItem) => (
@@ -2363,16 +2882,46 @@ function App() {
               <div className="mt-2 flex items-center justify-between text-[10px] text-slate-500">
                 <span>Lower</span>
                 <span>
-                  {metricRange.min === null ? 'n/a' : metricRange.min.toFixed(2)} to {metricRange.max === null ? 'n/a' : metricRange.max.toFixed(2)}
+                  {metricRange.min === null ? 'n/a' : formatMetricNumber(metricRange.min)} to {metricRange.max === null ? 'n/a' : formatMetricNumber(metricRange.max)}
                 </span>
                 <span>Higher</span>
               </div>
+
+              {!isSidebarOpen ? (
+                <div className="mt-4 rounded-[18px] border border-stone-200 bg-white/90 p-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">Preview metrics</p>
+                    <button
+                      type="button"
+                      className="rounded-full border border-stone-300 bg-white px-2 py-0.5 text-[10px] font-semibold text-slate-600 transition hover:bg-stone-50"
+                      onClick={() => setShowMapPreview((current) => !current)}
+                    >
+                      {showMapPreview ? 'Hide' : 'Show'}
+                    </button>
+                  </div>
+                  {showMapPreview ? (
+                    <div className="mt-2 space-y-1.5">
+                      {highlightCards.map((card) => (
+                        <div key={`map-preview-${card.metricId}`} className="flex items-center justify-between gap-2 text-[11px]">
+                          <span className="truncate text-slate-600" title={card.label}>{card.label}</span>
+                          <span className="shrink-0 font-semibold text-slate-900">
+                            {card.value === null ? 'N/A' : formatMetricNumber(card.value)}
+                            <span className="ml-1 text-[10px] font-normal text-slate-500">{card.unit}</span>
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
 
-            <div className="pointer-events-none absolute bottom-4 left-4 z-10 rounded-[20px] border border-white/70 bg-white/90 px-4 py-3 text-sm text-slate-700 shadow-lg backdrop-blur">
+            <div className="pointer-events-none absolute bottom-4 left-4 z-10 rounded-[20px] border border-white/70 bg-white/90 px-4 py-2.5 text-[13px] text-slate-700 shadow-lg backdrop-blur">
               {isDrawInteractionMode(drawMode)
                 ? 'Drawing/editing is active. Ward clicks are paused until the edit finishes.'
-                : 'Click wards to build the AOI. The panel on the left stays focused on one area at a time.'}
+                : isSidebarOpen
+                  ? 'Click wards to build the AOI. The sidebar stays focused on one area at a time.'
+                  : 'Click wards to build the AOI. Preview metrics stay visible here; open the sidebar for full drill-down and exports.'}
             </div>
           </div>
         </main>

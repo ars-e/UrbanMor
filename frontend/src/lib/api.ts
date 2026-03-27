@@ -14,9 +14,19 @@ import type {
 const LOCAL_API_BASE = 'http://127.0.0.1:8000'
 const PRODUCTION_API_BASE = 'https://urbanmor-api.onrender.com'
 const DEPLOYED_HOSTS = new Set(['www.inkletlab.com', 'inkletlab.com'])
+const NGROK_HOST_SUFFIXES = ['.ngrok-free.dev', '.ngrok.app', '.ngrok.dev', '.ngrok.io']
 
 function normalizeApiBase(value: string): string {
   return value.trim().replace(/\/+$/, '')
+}
+
+function isNgrokApiBase(base: string): boolean {
+  try {
+    const hostname = new URL(base).hostname.toLowerCase()
+    return NGROK_HOST_SUFFIXES.some((suffix) => hostname.endsWith(suffix))
+  } catch {
+    return false
+  }
 }
 
 function resolveApiBase(): string {
@@ -44,8 +54,16 @@ function resolveApiBase(): string {
 export const API_BASE = resolveApiBase()
 
 async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
+  const headers = new Headers(init?.headers ?? undefined)
+  if (isNgrokApiBase(API_BASE)) {
+    headers.set('ngrok-skip-browser-warning', '1')
+  }
+
   try {
-    return await fetch(`${API_BASE}${path}`, init)
+    return await fetch(`${API_BASE}${path}`, {
+      ...init,
+      headers,
+    })
   } catch (error) {
     const detail = error instanceof Error && error.message ? error.message : 'network request failed'
     throw new Error(`Unable to reach UrbanMor API at ${API_BASE}: ${detail}`)
@@ -54,7 +72,20 @@ async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
 
 async function parseResponse<T>(response: Response): Promise<T> {
   if (response.ok) {
-    return (await response.json()) as T
+    const contentType = response.headers.get('content-type') ?? ''
+    if (contentType.includes('application/json')) {
+      return (await response.json()) as T
+    }
+
+    const bodyText = await response.text()
+    if (contentType.includes('text/html') && bodyText.includes('ERR_NGROK_')) {
+      throw new Error(
+        `ngrok blocked browser API access for ${API_BASE}. Request needs the "ngrok-skip-browser-warning" header.`,
+      )
+    }
+    throw new Error(
+      `UrbanMor API returned unexpected content type "${contentType || 'unknown'}" from ${API_BASE}`,
+    )
   }
 
   let detail = `UrbanMor API returned HTTP ${response.status} from ${API_BASE}`

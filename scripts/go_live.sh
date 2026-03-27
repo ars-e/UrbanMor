@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # UrbanMor — go live
 #
-# Restarts the tunnel (with a fresh URL) and redeploys the Vercel frontend to point at it.
+# Ensures the stable ngrok LaunchAgent is serving the local backend, then
+# redeploys the Vercel frontend to point at it.
 # Run this any time you want the site live, including after a long break.
 #
 # Usage:
@@ -9,16 +10,20 @@
 #
 # What it does:
 #   1. Checks the backend is healthy
-#   2. Restarts cloudflared (clears old log, gets a new tunnel URL)
+#   2. Restarts the ngrok LaunchAgent on the stable public domain
 #   3. Waits up to 60 s for a working tunnel
-#   4. Redeploys the Vercel frontend pointing at the new tunnel URL
+#   4. Redeploys the Vercel frontend pointing at the stable ngrok URL
 
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TUNNEL_LOG="$PROJECT_DIR/output/qa/cloudflared.agent.err.log"
+NGROK_STDOUT_LOG="$PROJECT_DIR/output/qa/ngrok.agent.out.log"
+NGROK_STDERR_LOG="$PROJECT_DIR/output/qa/ngrok.agent.err.log"
 SITE_DIR="/Users/ars-e/projects/inklet-lab-site"
 BACKEND_URL="http://127.0.0.1:8000"
+NGROK_URL="${NGROK_URL:-https://postparturient-damon-drowsily.ngrok-free.dev}"
+NGROK_LABEL="com.urbanmor.ngrok"
+LAUNCHD_TARGET="gui/$(id -u)/$NGROK_LABEL"
 
 log()  { echo "▶ $*"; }
 ok()   { echo "✓ $*"; }
@@ -35,40 +40,38 @@ if ! curl -fsS -m 5 "$BACKEND_URL/health" >/dev/null; then
 fi
 ok "Backend healthy"
 
-# ── 2. Restart cloudflared (fresh tunnel URL) ─────────────────────────────────
-log "Restarting cloudflared tunnel..."
-# Truncate the log so only the new session's URLs are in it
-> "$TUNNEL_LOG"
-launchctl kickstart -k gui/$(id -u)/com.urbanmor.cloudflared
-ok "Cloudflared restarted"
+# ── 2. Restart the ngrok LaunchAgent on the stable domain ─────────────────────
+if ! launchctl print "$LAUNCHD_TARGET" >/dev/null 2>&1; then
+  fail "ngrok LaunchAgent is not installed. Expected: ~/Library/LaunchAgents/com.urbanmor.ngrok.plist"
+fi
+log "Restarting ngrok LaunchAgent..."
+launchctl kickstart -k "$LAUNCHD_TARGET"
+ok "ngrok LaunchAgent restarted"
 
-# ── 3. Wait for a live tunnel URL ─────────────────────────────────────────────
-log "Waiting for tunnel to come up (up to 60 s)..."
-TUNNEL_URL=""
+# ── 3. Wait for the stable ngrok URL to come up ───────────────────────────────
+log "Waiting for ngrok to come up on $NGROK_URL (up to 60 s)..."
 for i in $(seq 1 12); do
-  # Pick the newest URL from the log
-  candidate=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$TUNNEL_LOG" 2>/dev/null | tail -1 || true)
-  if [[ -n "$candidate" ]] && curl -fsS -m 8 "$candidate/health" >/dev/null 2>&1; then
-    TUNNEL_URL="$candidate"
+  if curl -fsS -m 8 "$NGROK_URL/health" >/dev/null 2>&1; then
     break
   fi
   echo "  attempt $i/12 — waiting 5 s..."
   sleep 5
 done
 
-if [[ -z "$TUNNEL_URL" ]]; then
-  fail "Tunnel did not come up after 60 s. Check: tail -f $TUNNEL_LOG"
+if ! curl -fsS -m 8 "$NGROK_URL/health" >/dev/null 2>&1; then
+  fail "ngrok did not come up after 60 s. Check: tail -f $NGROK_STDOUT_LOG and tail -f $NGROK_STDERR_LOG"
 fi
-ok "Tunnel live: $TUNNEL_URL"
+ok "ngrok live: $NGROK_URL"
 
 # ── 4. Redeploy frontend to Vercel ────────────────────────────────────────────
-log "Deploying frontend → $TUNNEL_URL ..."
+log "Deploying frontend → $NGROK_URL ..."
 cd "$SITE_DIR"
-VITE_API_BASE_URL="$TUNNEL_URL" npm run sync:urbanmorph
-vercel --prod --yes
+VITE_API_BASE_URL="$NGROK_URL" npm run sync:umv1
+npx vercel --prod --yes
 
 echo
 echo "══════════════════════════════════════════════"
 echo " Live at: https://www.inkletlab.com/urbanmorph/"
-echo " API via: $TUNNEL_URL"
+echo " Live at: https://www.inkletlab.com/umv1/"
+echo " API via: $NGROK_URL"
 echo "══════════════════════════════════════════════"

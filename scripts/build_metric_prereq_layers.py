@@ -6,7 +6,7 @@ import re
 import subprocess
 from pathlib import Path
 
-ROOT = Path("/Users/ars-e/projects/UrbanMor")
+ROOT = Path("/Users/ars-e/projects/Morph")
 DB_NAME = os.getenv("DB_NAME", "urbanmor")
 CITIES = [
     "ahmedabad",
@@ -53,6 +53,7 @@ def bootstrap_sources_and_class_map() -> None:
         VALUES
           ('network_blocks_derivation', 'Network Blocks (Derived)', 'vector', 'UrbanMor derived pipeline', NULL, 'sql_derivation', '{}'::jsonb),
           ('routing_graph_derivation', 'Routing Graph (Derived)', 'vector', 'UrbanMor derived pipeline', NULL, 'sql_derivation', '{}'::jsonb),
+          ('transit_points_derivation', 'Transit Points (Derived)', 'vector', 'UrbanMor derived pipeline', NULL, 'sql_derivation', '{}'::jsonb),
           ('pedestrian_enrichment_derivation', 'Pedestrian Enriched Roads (Derived)', 'vector', 'UrbanMor derived pipeline', NULL, 'sql_derivation', '{}'::jsonb),
           ('building_levels_derivation', 'Building Levels Proxy (Derived)', 'vector', 'UrbanMor derived pipeline', NULL, 'sql_derivation', '{}'::jsonb),
           ('building_centroids_derivation', 'Building Centroids (Derived)', 'vector', 'UrbanMor derived pipeline', NULL, 'sql_derivation', '{}'::jsonb),
@@ -90,8 +91,10 @@ def bootstrap_sources_and_class_map() -> None:
         VALUES
           (1,  'Water',               'water',            TRUE,  FALSE, FALSE, FALSE, FALSE, FALSE, 'ESRI 10m class'),
           (2,  'Trees',               'green_vegetation', FALSE, TRUE,  FALSE, FALSE, FALSE, FALSE, 'ESRI 10m class'),
-          (4,  'Flooded Vegetation',  'wet_vegetation',   TRUE,  TRUE,  FALSE, FALSE, FALSE, FALSE, 'ESRI 10m class'),
+          (3,  'Grass',               'grass',            FALSE, TRUE,  TRUE,  FALSE, FALSE, TRUE,  'ESRI 10m class'),
+          (4,  'Flooded Vegetation',  'wet_vegetation',   FALSE, TRUE,  TRUE,  FALSE, FALSE, FALSE, 'ESRI 10m class'),
           (5,  'Crops',               'agriculture',      FALSE, TRUE,  FALSE, FALSE, FALSE, FALSE, 'ESRI 10m class'),
+          (6,  'Scrub/Shrub',         'scrub_shrub',      FALSE, TRUE,  TRUE,  FALSE, FALSE, TRUE,  'ESRI 10m class'),
           (7,  'Built Area',          'built_up',         FALSE, FALSE, FALSE, TRUE,  TRUE,  FALSE, 'Residential is proxy via built class'),
           (8,  'Bare Ground',         'bare_ground',      FALSE, FALSE, TRUE,  FALSE, FALSE, TRUE,  'Candidate vacant'),
           (9,  'Snow/Ice',            'other',            FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, 'ESRI 10m class'),
@@ -117,48 +120,123 @@ def build_network_blocks(city: str) -> None:
         f"""
         DROP TABLE IF EXISTS transport.{c}_network_blocks CASCADE;
         CREATE TABLE transport.{c}_network_blocks AS
-        WITH wards AS (
-          SELECT
-            ward_uid,
-            ward_id,
-            ST_Transform(geom, 3857) AS geom_3857
-          FROM boundaries.{c}_wards_normalized
-        ),
-        grid AS (
+        WITH ward_boundaries AS (
           SELECT
             w.ward_uid,
             w.ward_id,
-            g.geom AS cell_geom
-          FROM wards w,
-               LATERAL ST_SquareGrid(250, w.geom_3857) AS g
+            ST_Transform(w.geom, 3857)::geometry(MultiPolygon, 3857) AS geom
+          FROM boundaries.{c}_wards_normalized w
         ),
-        clipped AS (
+        roads AS (
           SELECT
-            g.ward_uid,
-            g.ward_id,
-            ST_Intersection(g.cell_geom, w.geom_3857) AS geom
-          FROM grid g
-          JOIN wards w
-            ON w.ward_uid = g.ward_uid
+            lower(COALESCE(r.highway, '')) AS highway,
+            (ST_Dump(
+              ST_CollectionExtract(
+                ST_MakeValid(ST_Transform(r.geom, 3857)),
+                2
+              )
+            )).geom::geometry(LineString, 3857) AS geom
+          FROM transport.{c}_roads_normalized r
+          WHERE r.geom IS NOT NULL
+            AND NOT ST_IsEmpty(r.geom)
+            AND lower(COALESCE(r.highway, '')) IN (
+              'motorway', 'motorway_link',
+              'trunk', 'trunk_link',
+              'primary', 'primary_link',
+              'secondary', 'secondary_link',
+              'tertiary', 'tertiary_link',
+              'unclassified', 'residential', 'living_street', 'service', 'road', 'busway'
+            )
         ),
-        parts AS (
+        ward_road_segments AS (
+          SELECT
+            w.ward_uid,
+            w.ward_id,
+            (ST_Dump(
+              ST_CollectionExtract(
+                ST_MakeValid(ST_Intersection(r.geom, w.geom)),
+                2
+              )
+            )).geom::geometry(LineString, 3857) AS geom
+          FROM ward_boundaries w
+          JOIN roads r
+            ON ST_Intersects(r.geom, w.geom)
+        ),
+        ward_boundary_edges AS (
+          SELECT
+            w.ward_uid,
+            w.ward_id,
+            (ST_Dump(
+              ST_CollectionExtract(
+                ST_Boundary(w.geom),
+                2
+              )
+            )).geom::geometry(LineString, 3857) AS geom
+          FROM ward_boundaries w
+        ),
+        ward_linework AS (
           SELECT
             ward_uid,
             ward_id,
-            (ST_Dump(ST_CollectionExtract(ST_MakeValid(geom), 3))).geom AS geom
-          FROM clipped
+            geom
+          FROM ward_road_segments
+          WHERE geom IS NOT NULL
+            AND NOT ST_IsEmpty(geom)
+            AND ST_Length(geom) > 1.0
+
+          UNION ALL
+
+          SELECT
+            ward_uid,
+            ward_id,
+            geom
+          FROM ward_boundary_edges
+          WHERE geom IS NOT NULL
+            AND NOT ST_IsEmpty(geom)
+        ),
+        ward_noded AS (
+          SELECT
+            ward_uid,
+            ward_id,
+            ST_Node(ST_UnaryUnion(ST_Collect(ST_SnapToGrid(geom, 0.5)))) AS geom
+          FROM ward_linework
+          GROUP BY ward_uid, ward_id
+        ),
+        ward_polygons AS (
+          SELECT
+            n.ward_uid,
+            n.ward_id,
+            (ST_Dump(
+              ST_CollectionExtract(
+                ST_MakeValid(ST_Polygonize(ARRAY[n.geom])),
+                3
+              )
+            )).geom::geometry(Polygon, 3857) AS geom
+          FROM ward_noded n
+          WHERE n.geom IS NOT NULL
+            AND NOT ST_IsEmpty(n.geom)
+        ),
+        cleaned AS (
+          SELECT
+            p.ward_uid,
+            p.ward_id,
+            p.geom
+          FROM ward_polygons p
+          WHERE p.geom IS NOT NULL
+            AND NOT ST_IsEmpty(p.geom)
+            AND ST_Area(p.geom) >= 25.0
         )
         SELECT
           '{c}'::text AS city,
           row_number() OVER ()::bigint AS block_id,
           ward_uid,
           ward_id,
+          'road_polygonize'::text AS derivation_method,
           ST_Transform(ST_Multi(geom), 4326)::geometry(MultiPolygon, 4326) AS geom,
-          ST_Area(geom)::double precision AS area_m2
-        FROM parts
+          ST_Area(ST_Transform(geom, 4326)::geography)::double precision AS area_m2
+        FROM cleaned
         WHERE geom IS NOT NULL
-          AND NOT ST_IsEmpty(geom)
-          AND ST_Area(geom) >= 250;
+          AND NOT ST_IsEmpty(geom);
 
         ALTER TABLE transport.{c}_network_blocks ADD PRIMARY KEY (block_id);
         CREATE INDEX {c}_network_blocks_geom_idx ON transport.{c}_network_blocks USING GIST (geom);
@@ -255,6 +333,35 @@ def build_routing_graph(city: str) -> None:
     )
 
 
+def build_transit_points(city: str) -> None:
+    c = ident(city)
+    run_sql(
+        f"""
+        DROP TABLE IF EXISTS transport.{c}_transit_points CASCADE;
+        CREATE TABLE transport.{c}_transit_points AS
+        SELECT
+          '{c}'::text AS city,
+          row_number() OVER ()::bigint AS transit_point_id,
+          t.source_layer,
+          ST_PointOnSurface(
+            CASE
+              WHEN ST_SRID(t.geom) = 4326 THEN ST_MakeValid(t.geom)
+              WHEN ST_SRID(t.geom) = 0 THEN ST_MakeValid(ST_SetSRID(t.geom, 4326))
+              ELSE ST_MakeValid(ST_Transform(t.geom, 4326))
+            END
+          )::geometry(Point, 4326) AS geom
+        FROM transport.{c}_transit_normalized t
+        WHERE t.geom IS NOT NULL
+          AND NOT ST_IsEmpty(t.geom);
+
+        ALTER TABLE transport.{c}_transit_points ADD PRIMARY KEY (transit_point_id);
+        CREATE INDEX {c}_transit_points_geom_idx ON transport.{c}_transit_points USING GIST (geom);
+        CREATE INDEX {c}_transit_points_src_idx ON transport.{c}_transit_points (source_layer);
+        ANALYZE transport.{c}_transit_points;
+        """
+    )
+
+
 def build_pedestrian_enriched_roads(city: str) -> None:
     c = ident(city)
     run_sql(
@@ -303,37 +410,44 @@ def build_building_levels_and_centroids(city: str) -> None:
         f"""
         DROP TABLE IF EXISTS buildings.{c}_building_levels_enriched CASCADE;
         CREATE TABLE buildings.{c}_building_levels_enriched AS
+        WITH thresholds AS (
+          SELECT
+            percentile_cont(0.25) WITHIN GROUP (ORDER BY footprint_area_m2) AS p25,
+            percentile_cont(0.50) WITHIN GROUP (ORDER BY footprint_area_m2) AS p50,
+            percentile_cont(0.75) WITHIN GROUP (ORDER BY footprint_area_m2) AS p75
+          FROM buildings.{c}_buildings_normalized
+          WHERE footprint_area_m2 IS NOT NULL
+            AND footprint_area_m2 > 0
+        )
         SELECT
           row_number() OVER ()::bigint AS bldg_id,
           b.*,
           NULL::double precision AS levels_observed,
           CASE
-            WHEN b.footprint_area_m2 IS NULL THEN 1
-            WHEN b.footprint_area_m2 < 80 THEN 1
-            WHEN b.footprint_area_m2 < 250 THEN 2
-            WHEN b.footprint_area_m2 < 600 THEN 3
+            WHEN b.footprint_area_m2 IS NULL THEN 2
+            WHEN b.footprint_area_m2 <= COALESCE(t.p25, 80.0) THEN 1
+            WHEN b.footprint_area_m2 <= COALESCE(t.p50, 180.0) THEN 2
+            WHEN b.footprint_area_m2 <= COALESCE(t.p75, 360.0) THEN 3
             ELSE 4
           END::double precision AS levels_estimated,
-          'heuristic_area_bucket'::text AS levels_source,
+          'heuristic_area_quantile'::text AS levels_source,
           CASE
             WHEN b.footprint_area_m2 IS NULL THEN 'low'
-            WHEN b.footprint_area_m2 < 80 THEN 'medium'
-            WHEN b.footprint_area_m2 < 250 THEN 'medium'
-            WHEN b.footprint_area_m2 < 600 THEN 'low'
             ELSE 'low'
           END::text AS levels_confidence,
           (
             COALESCE(b.footprint_area_m2, 0) *
             CASE
-              WHEN b.footprint_area_m2 IS NULL THEN 1
-              WHEN b.footprint_area_m2 < 80 THEN 1
-              WHEN b.footprint_area_m2 < 250 THEN 2
-              WHEN b.footprint_area_m2 < 600 THEN 3
+              WHEN b.footprint_area_m2 IS NULL THEN 2
+              WHEN b.footprint_area_m2 <= COALESCE(t.p25, 80.0) THEN 1
+              WHEN b.footprint_area_m2 <= COALESCE(t.p50, 180.0) THEN 2
+              WHEN b.footprint_area_m2 <= COALESCE(t.p75, 360.0) THEN 3
               ELSE 4
             END
           )::double precision AS floor_area_proxy_m2,
           ST_SetSRID(b.geom, 4326)::geometry(Geometry, 4326) AS geom_fixed
-        FROM buildings.{c}_buildings_normalized b;
+        FROM buildings.{c}_buildings_normalized b
+        CROSS JOIN thresholds t;
 
         ALTER TABLE buildings.{c}_building_levels_enriched DROP COLUMN geom;
         ALTER TABLE buildings.{c}_building_levels_enriched RENAME COLUMN geom_fixed TO geom;
@@ -407,7 +521,7 @@ def build_builtup_vacant_flood_rasters(city: str) -> None:
             rast,
             1,
             '8BUI',
-            'CASE WHEN ([rast] = 8 OR [rast] = 11) THEN 1 ELSE 0 END',
+            'CASE WHEN ([rast] = 3 OR [rast] = 6 OR [rast] = 8 OR [rast] = 11) THEN 1 ELSE 0 END',
             0
           ) AS rast
         FROM lulc.{c}_lulc_normalized;
@@ -533,7 +647,7 @@ def build_water_open_riparian(city: str) -> None:
             ST_Transform(dp.geom, 3857) AS geom_3857
           FROM lulc.{c}_lulc_normalized l,
                LATERAL ST_DumpAsPolygons(l.rast, 1, TRUE) AS dp
-          WHERE dp.val::int IN (8, 11)
+          WHERE dp.val::int IN (3, 6, 8, 11)
         ),
         all_open AS (
           SELECT source_layer, geom_3857 FROM osm_open
@@ -608,10 +722,10 @@ def build_population_proxy(city: str) -> None:
           w.ward_id,
           w.ward_name,
           COALESCE(sum(cn.population_proxy), 0)::double precision AS population_proxy,
-          (ST_Area(ST_Transform(w.geom, 3857)) / 1000000.0)::double precision AS area_sqkm,
+          (ST_Area(w.geom::geography) / 1000000.0)::double precision AS area_sqkm,
           CASE
-            WHEN ST_Area(ST_Transform(w.geom, 3857)) > 0 THEN
-              COALESCE(sum(cn.population_proxy), 0) / (ST_Area(ST_Transform(w.geom, 3857)) / 1000000.0)
+            WHEN ST_Area(w.geom::geography) > 0 THEN
+              COALESCE(sum(cn.population_proxy), 0) / (ST_Area(w.geom::geography) / 1000000.0)
             ELSE NULL
           END::double precision AS population_density_proxy,
           w.geom::geometry(MultiPolygon, 4326) AS geom
@@ -649,6 +763,7 @@ def upsert_layer_registry() -> None:
               WHEN c.relname LIKE '%_network_blocks' THEN 'network_blocks'
               WHEN c.relname LIKE '%_routing_graph_edges' THEN 'routing_graph_edges'
               WHEN c.relname LIKE '%_routing_graph_vertices' THEN 'routing_graph_vertices'
+              WHEN c.relname LIKE '%_transit_points' THEN 'transit_points'
               WHEN c.relname LIKE '%_roads_pedestrian_enriched' THEN 'footway_tags'
               WHEN c.relname LIKE '%_building_levels_enriched' THEN 'building_levels_tags'
               WHEN c.relname LIKE '%_building_centroids' THEN 'building_centroids'
@@ -669,6 +784,7 @@ def upsert_layer_registry() -> None:
             CASE
               WHEN c.relname LIKE '%_network_blocks' THEN 'network_blocks_derivation'
               WHEN c.relname LIKE '%_routing_graph_edges' OR c.relname LIKE '%_routing_graph_vertices' THEN 'routing_graph_derivation'
+              WHEN c.relname LIKE '%_transit_points' THEN 'transit_points_derivation'
               WHEN c.relname LIKE '%_roads_pedestrian_enriched' THEN 'pedestrian_enrichment_derivation'
               WHEN c.relname LIKE '%_building_levels_enriched' THEN 'building_levels_derivation'
               WHEN c.relname LIKE '%_building_centroids' THEN 'building_centroids_derivation'
@@ -700,7 +816,7 @@ def upsert_layer_registry() -> None:
            AND rc.r_raster_column = 'rast'
           WHERE c.relkind = 'r'
             AND (
-              (n.nspname = 'transport' AND (c.relname LIKE '%_network_blocks' OR c.relname LIKE '%_routing_graph_edges' OR c.relname LIKE '%_routing_graph_vertices' OR c.relname LIKE '%_roads_pedestrian_enriched'))
+              (n.nspname = 'transport' AND (c.relname LIKE '%_network_blocks' OR c.relname LIKE '%_routing_graph_edges' OR c.relname LIKE '%_routing_graph_vertices' OR c.relname LIKE '%_transit_points' OR c.relname LIKE '%_roads_pedestrian_enriched'))
               OR (n.nspname = 'buildings' AND (c.relname LIKE '%_building_levels_enriched' OR c.relname LIKE '%_building_centroids'))
               OR (n.nspname = 'green' AND (c.relname LIKE '%_water_bodies_canonical' OR c.relname LIKE '%_open_surfaces' OR c.relname LIKE '%_riparian_buffers' OR c.relname LIKE '%_vacant_land'))
               OR (n.nspname = 'dem' AND c.relname LIKE '%_flood_risk_proxy')
@@ -796,6 +912,8 @@ def main() -> int:
         build_network_blocks(city)
         print(f"[{city}] routing graph...")
         build_routing_graph(city)
+        print(f"[{city}] transit points...")
+        build_transit_points(city)
         print(f"[{city}] pedestrian roads...")
         build_pedestrian_enriched_roads(city)
         print(f"[{city}] building levels + centroids...")

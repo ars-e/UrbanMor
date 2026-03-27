@@ -46,6 +46,7 @@ DECLARE
   v_buildings jsonb;
   v_landuse jsonb;
   v_topography jsonb;
+  v_primary jsonb;
   v_composites jsonb := '{}'::jsonb;
   v_all jsonb;
 BEGIN
@@ -74,18 +75,22 @@ BEGIN
   v_buildings := metrics._call_family_two_args('metrics.analyse_buildings', v_city, v_geom);
   v_landuse := metrics._call_family_two_args('metrics.analyse_landuse', v_city, v_geom);
   v_topography := metrics._call_family_two_args('metrics.analyse_topography', v_city, v_geom);
+  v_primary := COALESCE(v_roads, '{}'::jsonb)
+            || COALESCE(v_buildings, '{}'::jsonb)
+            || COALESCE(v_landuse, '{}'::jsonb)
+            || COALESCE(v_topography, '{}'::jsonb);
 
-  -- Optional composites (if later implemented as a SQL function in DB).
-  IF to_regprocedure('metrics.analyse_composites(text,geometry)') IS NOT NULL THEN
+  -- Prefer composite computation from already-computed base metrics to avoid
+  -- re-running expensive family graph logic (especially roads).
+  IF to_regprocedure('metrics.analyse_composites_from_metrics(jsonb)') IS NOT NULL THEN
+    EXECUTE 'SELECT metrics.analyse_composites_from_metrics($1)' INTO v_composites USING v_primary;
+    v_composites := COALESCE(v_composites, '{}'::jsonb);
+  ELSIF to_regprocedure('metrics.analyse_composites(text,geometry)') IS NOT NULL THEN
     EXECUTE 'SELECT metrics.analyse_composites($1, $2)' INTO v_composites USING v_city, v_geom;
     v_composites := COALESCE(v_composites, '{}'::jsonb);
   END IF;
 
-  v_all := COALESCE(v_roads, '{}'::jsonb)
-       || COALESCE(v_buildings, '{}'::jsonb)
-       || COALESCE(v_landuse, '{}'::jsonb)
-       || COALESCE(v_topography, '{}'::jsonb)
-       || COALESCE(v_composites, '{}'::jsonb);
+  v_all := v_primary || COALESCE(v_composites, '{}'::jsonb);
 
   RETURN jsonb_build_object(
     'city', v_city,

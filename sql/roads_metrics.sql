@@ -111,6 +111,26 @@ BEGIN
 END;
 $$;
 
+-- Motorized-road filter for graph-based road metrics.
+-- Explicit allow-list avoids pulling pedestrian-only links into connectivity metrics.
+CREATE OR REPLACE FUNCTION metrics._is_motorized_road(p_highway text)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+  SELECT COALESCE(lower(trim(p_highway)), '') IN (
+    'motorway', 'motorway_link',
+    'trunk', 'trunk_link',
+    'primary', 'primary_link',
+    'secondary', 'secondary_link',
+    'tertiary', 'tertiary_link',
+    'unclassified', 'residential',
+    'living_street', 'service',
+    'road', 'busway'
+  );
+$$;
+
 -- Shared clipped-road graph derivation:
 -- - clips roads to input polygon (projected),
 -- - nodes edges, then derives node degree and orientation entropy.
@@ -142,6 +162,7 @@ DECLARE
   v_blocks_sql text;
   v_avg_block double precision;
   v_var_block double precision;
+  v_has_block_method boolean := false;
 BEGIN
   v_city := metrics._normalize_city(p_city);
   v_geom_4326 := metrics._normalize_polygon_geom(p_geom);
@@ -175,6 +196,7 @@ BEGIN
       FROM %I.%I r
       WHERE r.geom IS NOT NULL
         AND NOT ST_IsEmpty(r.geom)
+        AND metrics._is_motorized_road(r.highway)
         AND ST_Intersects(metrics._to_3857(r.geom), $1)
     ),
     clipped AS (
@@ -250,42 +272,52 @@ BEGIN
       COALESCE((SELECT COUNT(*) FROM node_degree WHERE degree >= 3), 0)::bigint AS intersection_count,
       COALESCE((SELECT COUNT(*) FROM node_degree WHERE degree = 1), 0)::bigint AS culdesac_count,
       COALESCE((SELECT SUM(length_m) FROM edges), 0)::double precision AS edge_length_m,
-      (SELECT h_bits FROM entropy)::double precision AS orientation_entropy_bits
+      (SELECT h_bits FROM entropy)::double precision AS orientation_entropy_bits,
+      NULL::double precision AS avg_block_size_m2,
+      NULL::double precision AS block_size_variance_m2
   $SQL$, 'transport', v_city || '_roads_normalized');
 
-  -- Fetch main graph stats
   EXECUTE v_sql
   INTO edge_count, node_count, connected_node_count, intersection_count, culdesac_count,
-       edge_length_m, orientation_entropy_bits
+       edge_length_m, orientation_entropy_bits, avg_block_size_m2, block_size_variance_m2
   USING v_geom_3857;
 
-  -- Optional block stats: check if _network_blocks table exists, return NULL if not.
+  -- Use precomputed road-derived block table only when it is explicitly marked.
+  -- Older grid-based derivations lacked derivation metadata and are ignored.
   v_blocks_table := format('%I.%I', 'transport', v_city || '_network_blocks');
   IF to_regclass(v_blocks_table) IS NOT NULL THEN
-    v_blocks_sql := format($SQL$
-      WITH clipped AS (
-        SELECT
-          ST_Area(ST_Intersection(b.geom, $2)::geography)::double precision AS area_m2
-        FROM %I.%I b
-        WHERE b.geom IS NOT NULL
-          AND NOT ST_IsEmpty(b.geom)
-          AND b.geom && $2
-          AND ST_Intersects(b.geom, $2)
-      )
-      SELECT
-        AVG(area_m2)::double precision,
-        VAR_POP(area_m2)::double precision
-      FROM clipped
-      WHERE area_m2 > 1.0
-    $SQL$, 'transport', v_city || '_network_blocks');
-    EXECUTE v_blocks_sql INTO v_avg_block, v_var_block USING v_geom_3857, v_geom_4326;
-  ELSE
-    v_avg_block := NULL;
-    v_var_block := NULL;
-  END IF;
+    SELECT EXISTS (
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema='transport'
+        AND table_name = v_city || '_network_blocks'
+        AND column_name='derivation_method'
+    )
+    INTO v_has_block_method;
 
-  avg_block_size_m2      := v_avg_block;
-  block_size_variance_m2 := v_var_block;
+    IF v_has_block_method THEN
+      v_blocks_sql := format($SQL$
+        WITH clipped AS (
+          SELECT
+            ST_Area(ST_Intersection(b.geom, $2)::geography)::double precision AS area_m2
+          FROM %I.%I b
+          WHERE b.geom IS NOT NULL
+            AND NOT ST_IsEmpty(b.geom)
+            AND b.derivation_method = 'road_polygonize'
+            AND b.geom && $2
+            AND ST_Intersects(b.geom, $2)
+        )
+        SELECT
+          AVG(area_m2)::double precision,
+          VAR_POP(area_m2)::double precision
+        FROM clipped
+        WHERE area_m2 > 1.0
+      $SQL$, 'transport', v_city || '_network_blocks');
+      EXECUTE v_blocks_sql INTO v_avg_block, v_var_block USING v_geom_3857, v_geom_4326;
+      avg_block_size_m2 := v_avg_block;
+      block_size_variance_m2 := v_var_block;
+    END IF;
+  END IF;
 
   RETURN NEXT;
 END;
@@ -432,8 +464,8 @@ BEGIN
   END IF;
 
   v_raw := v_stats.edge_count::double precision / v_stats.node_count::double precision;
-  -- Normalized link-node score: 0..100, where ~3 links/node maps to 100.
-  RETURN LEAST(100.0, GREATEST(0.0, (v_raw / 3.0) * 100.0));
+  -- Planar street grids typically approach ~2 links/node (E/V ~= 2 for 4-way meshes).
+  RETURN LEAST(100.0, GREATEST(0.0, (v_raw / 2.0) * 100.0));
 END;
 $$;
 
@@ -473,6 +505,7 @@ DECLARE
   v_sql text;
   v_val double precision;
   v_rel text;
+  v_highway_filter text := '';
 BEGIN
   v_city := metrics._normalize_city(p_city);
   v_geom_4326 := metrics._normalize_polygon_geom(p_geom);
@@ -485,6 +518,7 @@ BEGIN
     v_rel := v_city || '_routing_graph_edges';
   ELSIF to_regclass(format('%I.%I', 'transport', v_city || '_roads_normalized')) IS NOT NULL THEN
     v_rel := v_city || '_roads_normalized';
+    v_highway_filter := 'AND metrics._is_motorized_road(r.highway)';
   ELSE
     RETURN NULL;
   END IF;
@@ -501,6 +535,7 @@ BEGIN
       FROM %I.%I r
       WHERE r.geom IS NOT NULL
         AND NOT ST_IsEmpty(r.geom)
+        %s
         AND ST_Intersects(metrics._to_3857(r.geom), $1)
     ),
     seg AS (
@@ -525,7 +560,7 @@ BEGIN
         ELSE (SUM(ratio * path_m) / SUM(path_m))::double precision
       END AS weighted_avg_ratio
     FROM ratios
-  $SQL$, 'transport', v_rel);
+  $SQL$, 'transport', v_rel, v_highway_filter);
 
   EXECUTE v_sql INTO v_val USING v_geom_3857;
   RETURN v_val;
@@ -591,6 +626,7 @@ BEGIN
       FROM %I.%I r
       WHERE r.geom IS NOT NULL
         AND NOT ST_IsEmpty(r.geom)
+        AND metrics._is_motorized_road(r.highway)
         AND ST_Intersects(r.geom, $1)
     ),
     agg AS (
@@ -782,6 +818,138 @@ BEGIN
 END;
 $$;
 
+-- Shared sampled nearest-distance helper for transit access metrics.
+-- Uses precomputed city transit points when available for significantly faster refreshes.
+CREATE OR REPLACE FUNCTION metrics._compute_transit_distance_sampled(
+  p_city text,
+  p_geom geometry,
+  p_layers text[],
+  p_sample_count integer DEFAULT 160
+)
+RETURNS double precision
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+  v_city text;
+  v_geom_4326 geometry(MultiPolygon, 4326);
+  v_geom_3857 geometry(MultiPolygon, 3857);
+  v_sql text;
+  v_val double precision;
+  v_samples integer;
+BEGIN
+  v_city := metrics._normalize_city(p_city);
+  v_geom_4326 := metrics._normalize_polygon_geom(p_geom);
+  IF v_geom_4326 IS NULL THEN
+    RETURN NULL;
+  END IF;
+  IF p_layers IS NULL OR array_length(p_layers, 1) IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  v_geom_3857 := metrics._to_3857(v_geom_4326)::geometry(MultiPolygon, 3857);
+  v_samples := LEAST(400, GREATEST(24, COALESCE(p_sample_count, 160)));
+
+  IF to_regclass(format('%I.%I', 'transport', v_city || '_transit_points')) IS NOT NULL THEN
+    v_sql := format($SQL$
+      WITH g AS (
+        SELECT
+          $1::geometry(MultiPolygon, 4326) AS geom,
+          $2::geometry(MultiPolygon, 3857) AS geom_3857
+      ),
+      targets AS (
+        SELECT t.geom::geometry(Point, 4326) AS geom
+        FROM %I.%I t
+        WHERE t.geom IS NOT NULL
+          AND NOT ST_IsEmpty(t.geom)
+          AND t.source_layer = ANY($3)
+      ),
+      samples AS (
+        SELECT
+          ST_Transform((dp.geom)::geometry(Point, 3857), 4326)::geometry(Point, 4326) AS geom
+        FROM g,
+             LATERAL ST_Dump(ST_GeneratePoints(g.geom_3857, $4, 20260326)) AS dp
+        LIMIT $4
+      ),
+      fallback_sample AS (
+        SELECT ST_PointOnSurface(g.geom)::geometry(Point, 4326) AS geom
+        FROM g
+        WHERE NOT EXISTS (SELECT 1 FROM samples)
+      ),
+      all_samples AS (
+        SELECT geom FROM samples
+        UNION ALL
+        SELECT geom FROM fallback_sample
+      ),
+      nearest AS (
+        SELECT
+          (
+            SELECT ST_Distance(s.geom::geography, t.geom::geography)::double precision
+            FROM targets t
+            ORDER BY s.geom <-> t.geom
+            LIMIT 1
+          ) AS nearest_m
+        FROM all_samples s
+      )
+      SELECT AVG(nearest_m)::double precision
+      FROM nearest
+      WHERE nearest_m IS NOT NULL
+    $SQL$, 'transport', v_city || '_transit_points');
+  ELSIF to_regclass(format('%I.%I', 'transport', v_city || '_transit_normalized')) IS NOT NULL THEN
+    v_sql := format($SQL$
+      WITH g AS (
+        SELECT
+          $1::geometry(MultiPolygon, 4326) AS geom,
+          $2::geometry(MultiPolygon, 3857) AS geom_3857
+      ),
+      targets AS (
+        SELECT
+          ST_PointOnSurface(metrics._to_4326(t.geom))::geometry(Point, 4326) AS geom
+        FROM %I.%I t
+        WHERE t.geom IS NOT NULL
+          AND NOT ST_IsEmpty(t.geom)
+          AND t.source_layer = ANY($3)
+      ),
+      samples AS (
+        SELECT
+          ST_Transform((dp.geom)::geometry(Point, 3857), 4326)::geometry(Point, 4326) AS geom
+        FROM g,
+             LATERAL ST_Dump(ST_GeneratePoints(g.geom_3857, $4, 20260326)) AS dp
+        LIMIT $4
+      ),
+      fallback_sample AS (
+        SELECT ST_PointOnSurface(g.geom)::geometry(Point, 4326) AS geom
+        FROM g
+        WHERE NOT EXISTS (SELECT 1 FROM samples)
+      ),
+      all_samples AS (
+        SELECT geom FROM samples
+        UNION ALL
+        SELECT geom FROM fallback_sample
+      ),
+      nearest AS (
+        SELECT
+          (
+            SELECT ST_Distance(s.geom::geography, t.geom::geography)::double precision
+            FROM targets t
+            ORDER BY s.geom <-> t.geom
+            LIMIT 1
+          ) AS nearest_m
+        FROM all_samples s
+      )
+      SELECT AVG(nearest_m)::double precision
+      FROM nearest
+      WHERE nearest_m IS NOT NULL
+    $SQL$, 'transport', v_city || '_transit_normalized');
+  ELSE
+    RETURN NULL;
+  END IF;
+
+  EXECUTE v_sql INTO v_val USING v_geom_4326, v_geom_3857, p_layers, v_samples;
+  RETURN v_val;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION metrics.compute_transit_distance_to_metro_or_rail(
   p_city text,
   p_geom geometry
@@ -791,82 +959,40 @@ LANGUAGE plpgsql
 STABLE
 AS $$
 DECLARE
-  v_city text;
-  v_geom_4326 geometry(MultiPolygon, 4326);
-  v_sql text;
   v_val double precision;
 BEGIN
-  v_city := metrics._normalize_city(p_city);
-  v_geom_4326 := metrics._normalize_polygon_geom(p_geom);
-  IF v_geom_4326 IS NULL THEN
-    RETURN NULL;
-  END IF;
+  v_val := metrics._compute_transit_distance_sampled(
+    p_city,
+    p_geom,
+    ARRAY['metro_stations', 'rail_stations', 'metro_entrances']::text[],
+    120
+  );
+  RETURN v_val;
+END;
+$$;
 
-  IF to_regclass(format('%I.%I', 'transport', v_city || '_transit_normalized')) IS NULL THEN
-    RETURN NULL;
-  END IF;
-
-  v_sql := format($SQL$
-    WITH g AS (
-      SELECT
-        $1::geometry(MultiPolygon, 4326) AS geom,
-        $2::geometry(MultiPolygon, 3857) AS geom_3857
-    ),
-    targets AS (
-      SELECT
-        ST_PointOnSurface(metrics._to_4326(t.geom))::geometry(Point, 4326) AS geom
-      FROM %I.%I t
-      WHERE t.geom IS NOT NULL
-        AND NOT ST_IsEmpty(t.geom)
-        AND t.source_layer IN (
-          'metro_stations',
-          'rail_stations',
-          'public_transport_stations',
-          'public_transport_stops'
-        )
-    ),
-    samples AS (
-      SELECT
-        ST_Transform(
-          ST_PointOnSurface(ST_Intersection(sg.geom, g.geom_3857)),
-          4326
-        )::geometry(Point, 4326) AS geom
-      FROM g,
-           LATERAL ST_SquareGrid(300.0, g.geom_3857) AS sg
-      WHERE ST_Intersects(sg.geom, g.geom_3857)
-      LIMIT 800
-    ),
-    fallback_sample AS (
-      SELECT ST_PointOnSurface(g.geom)::geometry(Point, 4326) AS geom
-      FROM g
-      WHERE NOT EXISTS (SELECT 1 FROM samples)
-    ),
-    all_samples AS (
-      SELECT geom FROM samples
-      UNION ALL
-      SELECT geom FROM fallback_sample
-    ),
-    nearest AS (
-      SELECT
-        (
-          SELECT ST_Distance(s.geom::geography, t.geom::geography)::double precision
-          FROM (
-            SELECT geom
-            FROM targets t
-            ORDER BY s.geom <-> t.geom
-            LIMIT 8
-          ) t
-          ORDER BY ST_Distance(s.geom::geography, t.geom::geography)
-          LIMIT 1
-        ) AS nearest_m
-      FROM all_samples s
-    )
-    SELECT AVG(nearest_m)::double precision
-    FROM nearest
-    WHERE nearest_m IS NOT NULL
-  $SQL$, 'transport', v_city || '_transit_normalized');
-
-  EXECUTE v_sql INTO v_val USING v_geom_4326, metrics._to_3857(v_geom_4326);
+CREATE OR REPLACE FUNCTION metrics.compute_transit_distance_to_bus_stop(
+  p_city text,
+  p_geom geometry
+)
+RETURNS double precision
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+  v_val double precision;
+BEGIN
+  v_val := metrics._compute_transit_distance_sampled(
+    p_city,
+    p_geom,
+    ARRAY[
+      'public_transport_stops',
+      'public_transport_platforms',
+      'public_transport_shelters',
+      'public_transport_stations'
+    ]::text[],
+    160
+  );
   RETURN v_val;
 END;
 $$;
@@ -995,7 +1121,7 @@ BEGIN
   ELSE
     v_connectivity_idx := LEAST(
       100.0,
-      GREATEST(0.0, ((v_stats.edge_count::double precision / v_stats.node_count::double precision) / 3.0) * 100.0)
+      GREATEST(0.0, ((v_stats.edge_count::double precision / v_stats.node_count::double precision) / 2.0) * 100.0)
     );
     v_culdesac_ratio := (v_stats.culdesac_count::double precision / v_stats.node_count::double precision) * 100.0;
   END IF;
@@ -1015,6 +1141,7 @@ BEGIN
     'road.pedestrian_infra_ratio', metrics.compute_road_pedestrian_infra_ratio(p_city, p_geom),
     'transit.stop_density', metrics.compute_transit_stop_density(p_city, p_geom),
     'transit.distance_to_metro_or_rail', metrics.compute_transit_distance_to_metro_or_rail(p_city, p_geom),
+    'transit.distance_to_bus_stop', metrics.compute_transit_distance_to_bus_stop(p_city, p_geom),
     'transit.coverage_500m', metrics.compute_transit_coverage_500m(p_city, p_geom)
   );
 END;

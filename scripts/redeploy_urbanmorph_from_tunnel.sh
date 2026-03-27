@@ -1,49 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TUNNEL_LOG="/Users/ars-e/projects/UrbanMor/output/qa/cloudflared.agent.err.log"
+NGROK_URL="${NGROK_URL:-https://postparturient-damon-drowsily.ngrok-free.dev}"
 SITE_DIR="/Users/ars-e/projects/inklet-lab-site"
 
-if [[ ! -f "$TUNNEL_LOG" ]]; then
-  echo "Tunnel log not found: $TUNNEL_LOG" >&2
-  exit 1
-fi
-
-TUNNEL_CANDIDATES=()
-while IFS= read -r candidate; do
-  TUNNEL_CANDIDATES+=("$candidate")
-done < <(rg -o 'https://[a-z0-9-]+\.trycloudflare\.com' -N "$TUNNEL_LOG" | awk '!seen[$0]++')
-if [[ ${#TUNNEL_CANDIDATES[@]} -eq 0 ]]; then
-  echo "Could not detect tunnel URL from log: $TUNNEL_LOG" >&2
-  exit 1
-fi
-
-TUNNEL_URL=""
-for (( idx=${#TUNNEL_CANDIDATES[@]}-1; idx>=0; idx-- )); do
-  candidate="${TUNNEL_CANDIDATES[$idx]}"
-  if curl -fsS -m 8 "$candidate/health" >/dev/null; then
-    TUNNEL_URL="$candidate"
-    break
-  fi
-done
-
-if [[ -z "$TUNNEL_URL" ]]; then
-  echo "No healthy tunnel URL found in $TUNNEL_LOG" >&2
-  printf 'Checked URLs (newest first):\n' >&2
-  for (( idx=${#TUNNEL_CANDIDATES[@]}-1; idx>=0; idx-- )); do
-    printf '  %s\n' "${TUNNEL_CANDIDATES[$idx]}" >&2
-  done
+if ! curl -fsS -m 8 "$NGROK_URL/health" >/dev/null; then
+  echo "Stable ngrok URL is not healthy: $NGROK_URL" >&2
+  echo "Start it with:" >&2
+  echo "  ngrok http 8000 --url=$NGROK_URL" >&2
   exit 1
 fi
 
 if [[ "${1:-}" == "--print" ]]; then
-  echo "$TUNNEL_URL"
+  echo "$NGROK_URL"
   exit 0
 fi
 
-echo "Using tunnel URL: $TUNNEL_URL"
+echo "Using stable ngrok URL: $NGROK_URL"
 cd "$SITE_DIR"
-VITE_API_BASE_URL="$TUNNEL_URL" npm run sync:urbanmorph
-vercel --prod --yes
+VITE_API_BASE_URL="$NGROK_URL" npm run sync:umv1
+npx vercel --prod --yes
 
-echo "Done. /urbanmorph now points to: $TUNNEL_URL"
+echo "Done. /urbanmorph and /umv1 now point to: $NGROK_URL"

@@ -20,9 +20,11 @@ interface HighlightDefinition {
 export const MAP_METRIC_IDS = [
   'road.intersection_density',
   'road.cnr',
+  'road.avg_block_size',
   'road.pedestrian_infra_ratio',
   'transit.coverage_500m',
-  'bldg.bcr',
+  'bldg.avg_footprint_size',
+  'open.park_green_space_density',
   'lulc.green_cover_pct',
   'open.distance_to_nearest_park',
   'cmp.walkability_index',
@@ -30,34 +32,47 @@ export const MAP_METRIC_IDS = [
 
 const HIGHLIGHT_DEFINITIONS: HighlightDefinition[] = [
   {
-    metricId: 'road.intersection_density',
-    theme: 'Street fabric',
-    fallbackLabel: 'Intersection Density',
+    metricId: 'road.cnr',
+    theme: 'Connectivity',
+    fallbackLabel: 'Connected Node Ratio (CNR)',
     narrative: (_value, _avg, context) =>
-      `This reads the street network grain for ${context}. Higher values usually mean shorter blocks and more route choice.`,
+      `This indicates street-network connectivity in ${context}. Higher CNR usually means fewer dead ends and better route choice.`,
   },
   {
-    metricId: 'transit.coverage_500m',
-    theme: 'Transit reach',
-    fallbackLabel: 'Transit Coverage (500m)',
+    metricId: 'road.avg_block_size',
+    theme: 'Block grain',
+    fallbackLabel: 'Average Block Size',
     narrative: (_value, _avg, context) =>
-      `This estimates how much of ${context} sits within a comfortable walk of transit stops or stations.`,
+      `This reflects the typical block footprint in ${context}. Lower values usually mean finer-grained, more walkable blocks.`,
   },
   {
-    metricId: 'bldg.bcr',
-    theme: 'Built intensity',
-    fallbackLabel: 'Building Coverage Ratio',
+    metricId: 'bldg.avg_footprint_size',
+    theme: 'Building footprint',
+    fallbackLabel: 'Average Building Footprint Size',
     narrative: (_value, _avg, context) =>
-      `This shows how much ground in ${context} is occupied by building footprints, not how tall the area is.`,
+      `This reports typical building footprint size in ${context}. Higher values usually indicate larger building parcels.`,
   },
   {
-    metricId: 'lulc.green_cover_pct',
-    theme: 'Green relief',
-    fallbackLabel: 'Green Cover',
+    metricId: 'open.park_green_space_density',
+    theme: 'Open spaces',
+    fallbackLabel: 'Park & Green Space Density',
     narrative: (_value, _avg, context) =>
-      `This captures vegetation share inside ${context}, giving a direct read on environmental relief and openness.`,
+      `This captures park and open-space availability across ${context}, reflecting access to breathable, non-built land.`,
   },
 ]
+
+function toNumeric(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value
+  }
+  if (typeof value === 'string') {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) {
+      return parsed
+    }
+  }
+  return null
+}
 
 function classifyComparison(value: number | null, cityAverage: number | null): string {
   if (value === null || cityAverage === null) {
@@ -88,8 +103,7 @@ export function buildHighlightCards(
 
   return HIGHLIGHT_DEFINITIONS.map((definition) => {
     const meta = metaById.get(definition.metricId)
-    const rawValue = metricsPayload[definition.metricId]
-    const value = typeof rawValue === 'number' && Number.isFinite(rawValue) ? rawValue : null
+    const value = toNumeric(metricsPayload[definition.metricId])
     const cityAverage = cityAverageMap.get(definition.metricId) ?? null
     return {
       metricId: definition.metricId,

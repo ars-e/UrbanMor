@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "build:umv1": "tsc -b && vite build --base=/umv1/",
     "build:urbanmorph": "tsc -b && vite build --base=/urbanmorph/",
     "lint": "eslint .",
     "preview": "vite preview"

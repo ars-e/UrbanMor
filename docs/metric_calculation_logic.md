@@ -30,35 +30,37 @@ This document describes how UrbanMor computes each metric, which source layers i
 
 ### Null behavior
 - Metrics return `NULL` when required source tables are missing, the input geometry is invalid/empty, or no valid observations exist.
-- Composite metrics return `NULL` only when all component metrics are `NULL`; otherwise missing components are treated as zero and the final score is clamped to `0..100`.
+- Composite metrics return `NULL` only when all component metrics are `NULL`; otherwise missing components are excluded and remaining weights are renormalized.
 
 ## Road and Transit Metrics
 
 ### Shared road graph derivation
 The road-family metrics use a shared graph derivation:
+- Keep only motorized road classes (`motorway` through `service`/`road`/`busway`).
 - Clip roads to the polygon in EPSG:3857.
 - Node the unioned network with `ST_Node(ST_UnaryUnion(...))`.
 - Split the result into noded edges.
 - Build node degrees from snapped start/endpoints (0.5 m snap grid).
 - Compute orientation entropy from 10-degree bearing bins weighted by edge length.
-- Where available, compute block statistics from `transport.<city>_network_blocks` clipped to the polygon.
+- Compute block statistics by polygonizing the noded road network inside the AOI.
 
 | Metric | Formula / Logic | Unit | Notes |
 | --- | --- | --- | --- |
 | `road.intersection_density` | `intersection_count / area_sqkm` | intersections/sq km | Intersections are nodes with degree `>= 3`. |
-| `road.cnr` | `intersection_count / (intersection_count + culdesac_count) * 100` | percent | This is not “connected nodes / total nodes”. |
+| `road.cnr` | `connected_node_count / node_count * 100` | percent | Connected nodes are graph nodes with degree `>= 2`. |
 | `road.node_density` | `node_count / area_sqkm` | nodes/sq km | Node count comes from snapped graph endpoints. |
 | `road.edge_density` | `edge_length_km / area_sqkm` | km/sq km | Edge length comes from noded graph edges. |
-| `road.avg_block_size` | Mean clipped block polygon area | sq m | Uses `transport.<city>_network_blocks` when available. |
-| `road.block_size_variance` | Population variance of clipped block polygon area | sq m^2 | Uses `transport.<city>_network_blocks` when available. |
-| `road.street_connectivity_index` | `clamp((edge_count / node_count) / 3 * 100)` | index | Link-node ratio normalized so ~3 links/node maps to 100. |
+| `road.avg_block_size` | Mean polygonized motorized-road block area inside AOI | sq m | Derived directly from the noded graph. |
+| `road.block_size_variance` | Population variance of polygonized motorized-road block area | sq m^2 | Derived directly from the noded graph. |
+| `road.street_connectivity_index` | `clamp((edge_count / node_count) / 2 * 100)` | index | Link-node ratio normalized so planar 4-way mesh behavior maps near 100. |
 | `road.culdesac_ratio` | `culdesac_count / node_count * 100` | percent | Cul-de-sacs are nodes with degree `= 1`. |
 | `road.circuity` | Length-weighted mean of `segment_length / endpoint_chord_length` | ratio | Proxy only. This is segment sinuosity, not OD routing circuity. |
 | `road.orientation_entropy` | Shannon entropy of 10-degree road-bearing bins | bits | Length-weighted. Higher means less directional order. |
 | `road.network_density_by_type` | Geodesic road length per sq km by `highway` class | JSON | Returns `total_km_per_sq_km` and `by_highway`. |
 | `road.pedestrian_infra_ratio` | `pedestrian_capable_length / total_clipped_length * 100` | percent | Uses `is_pedestrian_link` when enriched table exists, else OSM/tag heuristics. |
 | `transit.stop_density` | `stop_count / area_sqkm` | stops/sq km | Count of transit features intersecting the polygon. |
-| `transit.distance_to_metro_or_rail` | Mean geodesic nearest distance from 300 m interior samples to nearest metro/rail/transit target | meters | Uses KNN shortlist then exact geography distance. |
+| `transit.distance_to_metro_or_rail` | Mean geodesic nearest distance from 300 m interior samples to nearest metro/rail target | meters | Uses KNN shortlist then exact geography distance. |
+| `transit.distance_to_bus_stop` | Mean geodesic nearest distance from 300 m interior samples to nearest bus-stop/platform/station target | meters | Uses KNN shortlist then exact geography distance. |
 | `transit.coverage_500m` | `area(intersection(polygon, union(buffer_500m(transit_targets)))) / area(polygon) * 100` | percent | Uses 500 m station/stop buffers. |
 
 ## Built Form Metrics
@@ -66,7 +68,7 @@ The road-family metrics use a shared graph derivation:
 | Metric | Formula / Logic | Unit | Notes |
 | --- | --- | --- | --- |
 | `bldg.bcr` | `sum(clipped_building_area_m2) / polygon_area_m2 * 100` | percent | Uses clipped footprint area, not full-building area. |
-| `bldg.density_per_ha` | `building_count / area_ha` | buildings/ha | Counts buildings intersecting the polygon. |
+| `bldg.density_per_ha` | `building_count / area_ha` | buildings/ha | Counts buildings whose interior representative point is contained by the polygon. |
 | `bldg.avg_footprint_size` | Mean clipped footprint area | sq m | Buildings under 1 sq m are ignored. |
 | `bldg.size_distribution` | Population variance, P50, and P90 of clipped footprint area | summary stats | Returns JSON with `variance_m2`, `p50_m2`, `p90_m2`. |
 | `bldg.clustering_coeff` | Mean local clustering coefficient of a 60 m centroid-neighbor graph, scaled by `* 100` | index | Uses up to 400 centroids. This is now an actual graph coefficient, not an inverse-distance proxy. |
@@ -75,7 +77,7 @@ The road-family metrics use a shared graph derivation:
 | `bldg.orientation` | Circular mean axial orientation of major oriented-envelope axis | degrees | Axial mean is computed on doubled angles and folded back to `0..180`. |
 | `bldg.footprint_regularity` | Mean isoperimetric quotient `(4πA / P^2) * 100` | index | Computed on clipped footprint polygons. |
 | `bldg.edge_coverage` | Share of roughly 20 m road samples within 15 m of nearby building footprints | percent | Proxy only. This approximates active/fronted road edge coverage without parcel frontage lines. |
-| `bldg.far_proxy` | `sum(area_weighted_floor_area_proxy_m2) / polygon_area_m2` | ratio proxy | If building levels exist, floor-area proxy is scaled by clipped footprint share; otherwise clipped footprint area is used as a one-storey fallback. |
+| `bldg.far_proxy` | `sum(area_weighted_floor_area_proxy_m2) / polygon_area_m2` | ratio proxy | If building levels exist, floor-area proxy is scaled by clipped footprint share; otherwise clipped footprint area is used as a one-storey fallback. Derived levels are a low-confidence area-quantile heuristic. |
 
 ## Land Use and Open Space Metrics
 
@@ -87,11 +89,11 @@ The road-family metrics use a shared graph derivation:
 | Metric | Formula / Logic | Unit | Notes |
 | --- | --- | --- | --- |
 | `lulc.green_cover_pct` | Share of raster area flagged `is_green` | percent | Direct raster-area share. |
-| `lulc.mix_index` | Shannon entropy of LULC class area proportions | index | Higher means more mixed land-use composition. |
-| `lulc.residential_cover_pct` | Share of raster area flagged `is_residential_proxy` | percent | Proxy depends on class-map tagging quality. |
+| `lulc.mix_index` | Shannon entropy of LULC class area proportions | nats | Higher means more mixed land-use composition. |
+| `lulc.residential_cover_pct` | Share of raster area flagged `is_residential_proxy` | percent | Returns null until the class map defines a residential proxy distinct from generic built-up. |
 | `lulc.agriculture_pct` | Share of raster area mapped to canonical class `agriculture` | percent | Uses canonical class mapping. |
 | `lulc.water_coverage_pct` | Prefer clipped canonical water polygons; otherwise raster water share | percent | Vector water bodies override raster-derived water when available. |
-| `lulc.impervious_ratio` | `max(lulc_built_area, building_area + road_buffer_area) / polygon_area * 100`, capped to polygon area | percent | Road area is approximated as a 4 m buffer around clipped road centerlines. |
+| `lulc.impervious_ratio` | `max(lulc_built_area, area(union(clipped_buildings, clipped_road_buffers))) / polygon_area * 100`, capped to polygon area | percent | Road area uses a 4 m buffer around clipped road centerlines and is re-clipped to AOI before union. |
 | `open.bare_ground_pct` | Share of raster area mapped to canonical class `bare_ground` | percent | Raster-derived. |
 | `open.park_green_space_density` | `park_area_ha / area_sqkm` | hectares/sq km | Uses open-space polygons from `green_parks_vegetation` and `sports_play_open`. |
 | `open.distance_to_nearest_park` | Mean geodesic nearest distance from 300 m interior samples to citywide park polygons | meters | Fixed to search the citywide park layer rather than only parks clipped inside the polygon. |
@@ -114,18 +116,18 @@ The road-family metrics use a shared graph derivation:
 ### Composite conventions
 - Every composite is clamped to `0..100`.
 - If every component is `NULL`, the composite is `NULL`.
-- Otherwise missing components contribute `0`.
+- Otherwise missing components are excluded and weights are renormalized over available components.
 
 | Metric | Formula / Logic | Unit | Notes |
 | --- | --- | --- | --- |
 | `cmp.walkability_index` | `0.25*intersection_norm + 0.25*cnr + 0.20*ped_ratio + 0.20*transit_coverage + 0.10*transit_distance_score` | index | `intersection_norm = clamp(intersection_density / 120 * 100)`; `transit_distance_score = 100 / (1 + distance_m / 500)`. |
-| `cmp.informality_index` | `0.35*density_norm + 0.25*(100-cnr) + 0.20*(100-green_cover) + 0.20*vacant_pct` | index | `density_norm = clamp(building_density_per_ha / 250 * 100)`. |
-| `cmp.heat_island_proxy` | `0.35*impervious + 0.25*bcr + 0.25*(100-green_cover) + 0.15*flat_area` | index proxy | Proxy only; no temperature observation is used. |
-| `cmp.development_pressure` | `0.40*vacant_pct + 0.35*density_norm + 0.25*edge_norm` | index | `density_norm = clamp(building_density_per_ha / 250 * 100)`; `edge_norm = clamp(edge_density / 30 * 100)`. |
-| `cmp.topographic_constraint_expansion` | `0.625*natural_constraint + 0.375*steep_pct` | index | Flood-risk proxy removed; weights renormalized from the previous formulation. |
+| `cmp.informality_index` | `0.35*density_norm + 0.25*culdesac_ratio + 0.20*(100-green_cover) + 0.20*vacant_pct` | index | `density_norm = clamp(building_density_per_ha / 250 * 100)`. |
+| `cmp.heat_island_proxy` | `0.50*impervious + 0.35*(100-green_cover) + 0.15*flat_area` | index proxy | Proxy only; no thermal imagery/station observations are used. |
+| `cmp.development_pressure` | `0.50*vacant_pct + 0.20*(100-density_norm) + 0.30*edge_norm` | index | `density_norm = clamp(building_density_per_ha / 250 * 100)`; `edge_norm = clamp(edge_density / 30 * 100)`. |
+| `cmp.topographic_constraint_expansion` | `natural_constraint` (fallback: `steep_pct`) | index | Avoids double-counting steep slope where natural-constraint already includes it. |
 | `cmp.green_accessibility` | `0.40*park_distance_score + 0.30*park_density_norm + 0.30*green_cover` | index | `park_distance_score = 100 / (1 + distance_m / 300)`; `park_density_norm = clamp(park_density_ha_sqkm / 80 * 100)`. |
 | `cmp.transit_access_green` | `0.55*transit_coverage + 0.45*green_accessibility` | index | Combines proximity to transit and access to green space. |
-| `cmp.compactness` | `0.30*bcr + 0.25*intersection_norm + 0.25*mix_norm + 0.20*circuity_score` | index | `mix_norm = clamp(mix_index / 3 * 100)`; `circuity_score = 100` when `circuity <= 1`, else `100 / (1 + ((circuity - 1) * 5))`. |
+| `cmp.compactness` | `0.30*bcr + 0.25*intersection_norm + 0.25*mix_norm + 0.20*circuity_score` | index | `mix_norm = clamp(mix_index / ln(11) * 100)`; `circuity_score = 100` when `circuity <= 1`, else `100 / (1 + ((circuity - 1) * 5))`. |
 
 ## Known Proxy / Blocked Metrics
 

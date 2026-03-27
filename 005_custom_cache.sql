@@ -22,6 +22,10 @@ BEGIN
   IF to_regprocedure('metrics._metric_quality_summary(jsonb)') IS NULL THEN
     RAISE EXCEPTION 'metrics._metric_quality_summary(jsonb) is required; run 004_ward_cache.sql first';
   END IF;
+
+  IF to_regprocedure('metrics._city_input_signature(text)') IS NULL THEN
+    RAISE EXCEPTION 'metrics._city_input_signature(text) is required; run 004_ward_cache.sql first';
+  END IF;
 END
 $$;
 
@@ -49,6 +53,7 @@ CREATE TABLE IF NOT EXISTS metrics.custom_geometry_cache (
   geom geometry(MultiPolygon, 4326) NOT NULL,
   metrics_json jsonb NOT NULL DEFAULT '{}'::jsonb,
   quality_summary jsonb NOT NULL DEFAULT '{}'::jsonb,
+  input_signature timestamptz,
   computed_at timestamptz NOT NULL DEFAULT now(),
   last_accessed_at timestamptz NOT NULL DEFAULT now(),
   hit_count bigint NOT NULL DEFAULT 0,
@@ -59,11 +64,17 @@ CREATE TABLE IF NOT EXISTS metrics.custom_geometry_cache (
   CONSTRAINT custom_geometry_cache_hit_count_chk CHECK (hit_count >= 0)
 );
 
+ALTER TABLE IF EXISTS metrics.custom_geometry_cache
+  ADD COLUMN IF NOT EXISTS input_signature timestamptz;
+
 CREATE INDEX IF NOT EXISTS idx_custom_cache_city_vintage
   ON metrics.custom_geometry_cache (city, vintage_year, computed_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_custom_cache_last_accessed
   ON metrics.custom_geometry_cache (last_accessed_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_custom_cache_input_signature
+  ON metrics.custom_geometry_cache (city, input_signature DESC, computed_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_custom_cache_geom_gist
   ON metrics.custom_geometry_cache
@@ -94,6 +105,8 @@ DECLARE
   v_city text;
   v_geom geometry(MultiPolygon, 4326);
   v_hash text;
+  v_input_signature timestamptz;
+  v_cached_signature timestamptz;
   v_metrics jsonb;
   v_quality jsonb;
   v_computed_at timestamptz;
@@ -110,21 +123,28 @@ BEGIN
   END IF;
 
   v_hash := metrics._normalized_geom_hash(v_geom);
+  v_input_signature := metrics._city_input_signature(v_city);
 
   SELECT
     c.metrics_json,
     c.quality_summary,
+    c.input_signature,
     c.computed_at
   INTO
     v_metrics,
     v_quality,
+    v_cached_signature,
     v_computed_at
   FROM metrics.custom_geometry_cache c
   WHERE c.city = v_city
     AND c.geom_hash = v_hash
     AND c.vintage_year = p_vintage_year;
 
-  IF FOUND THEN
+  IF FOUND
+    AND (
+      v_input_signature IS NULL
+      OR (v_cached_signature IS NOT NULL AND v_cached_signature >= v_input_signature)
+    ) THEN
     UPDATE metrics.custom_geometry_cache c
     SET last_accessed_at = now(),
         hit_count = c.hit_count + 1
@@ -154,6 +174,7 @@ BEGIN
     geom,
     metrics_json,
     quality_summary,
+    input_signature,
     computed_at,
     last_accessed_at,
     hit_count
@@ -165,6 +186,7 @@ BEGIN
     v_geom,
     v_metrics,
     v_quality,
+    v_input_signature,
     now(),
     now(),
     0
@@ -174,6 +196,7 @@ BEGIN
     SET geom = EXCLUDED.geom,
         metrics_json = EXCLUDED.metrics_json,
         quality_summary = EXCLUDED.quality_summary,
+        input_signature = EXCLUDED.input_signature,
         computed_at = EXCLUDED.computed_at,
         last_accessed_at = now(),
         hit_count = metrics.custom_geometry_cache.hit_count + 1

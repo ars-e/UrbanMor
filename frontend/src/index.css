@@ -68,6 +68,56 @@ body {
   box-shadow: var(--um-shadow);
 }
 
+.um-lens-shell {
+  width: 168px;
+  height: 168px;
+  position: relative;
+  overflow: hidden;
+  border-radius: 9999px;
+  border: 3px solid #d97706;
+  box-shadow:
+    0 0 0 2px rgba(217, 119, 6, 0.25),
+    0 12px 28px rgba(15, 23, 42, 0.3);
+}
+
+.um-lens-gloss {
+  position: absolute;
+  inset: -3px;
+  border-radius: 9999px;
+  pointer-events: none;
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.33) 0%, transparent 52%, rgba(15, 23, 42, 0.18) 100%);
+}
+
+.um-lens-crosshair {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 18px;
+  height: 18px;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+.um-lens-crosshair-h,
+.um-lens-crosshair-v {
+  position: absolute;
+  background: rgba(217, 119, 6, 0.86);
+}
+
+.um-lens-crosshair-h {
+  left: 0;
+  top: 8px;
+  width: 18px;
+  height: 2px;
+}
+
+.um-lens-crosshair-v {
+  left: 8px;
+  top: 0;
+  width: 2px;
+  height: 18px;
+}
+
 .maplibregl-ctrl-group {
   border-radius: 18px;
   border: 1px solid rgba(214, 211, 209, 0.9);

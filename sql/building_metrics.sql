@@ -183,8 +183,7 @@ BEGIN
     FROM %I.%I b
     WHERE b.geom IS NOT NULL
       AND NOT ST_IsEmpty(b.geom)
-      AND b.geom && $1
-      AND ST_Intersects(b.geom, $1)
+      AND ST_Contains($1, ST_PointOnSurface(metrics._to_4326(b.geom)))
   $SQL$, 'buildings', v_city || '_buildings_normalized');
 
   EXECUTE v_sql INTO v_cnt USING v_geom_4326;
@@ -312,7 +311,7 @@ BEGIN
         WHERE c.geom IS NOT NULL
           AND NOT ST_IsEmpty(c.geom)
           AND ST_Intersects(metrics._to_4326(c.geom), $1)
-        ORDER BY centroid_id
+        ORDER BY md5(centroid_id::text), centroid_id
         LIMIT 400
       ),
       undirected_edges AS (
@@ -371,7 +370,7 @@ BEGIN
         WHERE b.geom IS NOT NULL
           AND NOT ST_IsEmpty(b.geom)
           AND ST_Intersects(metrics._to_4326(b.geom), $1)
-        ORDER BY id
+        ORDER BY md5(id::text), id
         LIMIT 400
       ),
       undirected_edges AS (
@@ -459,7 +458,7 @@ BEGIN
         WHERE c.geom IS NOT NULL
           AND NOT ST_IsEmpty(c.geom)
           AND ST_Intersects(metrics._to_4326(c.geom), $1)
-        ORDER BY centroid_id
+        ORDER BY md5(centroid_id::text), centroid_id
         LIMIT 600
       ), nearest AS (
         SELECT (
@@ -488,7 +487,7 @@ BEGIN
         WHERE b.geom IS NOT NULL
           AND NOT ST_IsEmpty(b.geom)
           AND ST_Intersects(metrics._to_4326(b.geom), $1)
-        ORDER BY id
+        ORDER BY md5(id::text), id
         LIMIT 600
       ), nearest AS (
         SELECT (
@@ -549,6 +548,7 @@ BEGIN
       WHERE b.geom IS NOT NULL
         AND NOT ST_IsEmpty(b.geom)
         AND ST_Intersects(metrics._to_3857(b.geom), $1)
+      ORDER BY COALESCE(NULLIF(b.source_feature_id, ''), b.id::text), b.id
       LIMIT 2000
     ),
     poly AS (
@@ -563,17 +563,20 @@ BEGIN
     ), env AS (
       SELECT ST_OrientedEnvelope(geom) AS env
       FROM poly
-      WHERE geom IS NOT NULL AND NOT ST_IsEmpty(geom)
+      WHERE geom IS NOT NULL
+        AND NOT ST_IsEmpty(geom)
+        AND ST_Area(geom) > 4.0
     ), lens AS (
       SELECT
         ST_Distance(ST_PointN(ST_ExteriorRing(env), 1), ST_PointN(ST_ExteriorRing(env), 2))::double precision AS l1,
         ST_Distance(ST_PointN(ST_ExteriorRing(env), 2), ST_PointN(ST_ExteriorRing(env), 3))::double precision AS l2
       FROM env
       WHERE GeometryType(env) = 'POLYGON'
+        AND ST_NPoints(ST_ExteriorRing(env)) >= 4
     ), ratio AS (
       SELECT
         CASE
-          WHEN LEAST(l1, l2) <= 0 THEN NULL
+          WHEN LEAST(l1, l2) < 1.0 THEN NULL
           ELSE GREATEST(l1, l2) / LEAST(l1, l2)
         END::double precision AS r
       FROM lens
@@ -619,6 +622,7 @@ BEGIN
       WHERE b.geom IS NOT NULL
         AND NOT ST_IsEmpty(b.geom)
         AND ST_Intersects(metrics._to_3857(b.geom), $1)
+      ORDER BY COALESCE(NULLIF(b.source_feature_id, ''), b.id::text), b.id
       LIMIT 2000
     ),
     poly AS (
@@ -633,7 +637,9 @@ BEGIN
     ), env AS (
       SELECT ST_OrientedEnvelope(geom) AS env
       FROM poly
-      WHERE geom IS NOT NULL AND NOT ST_IsEmpty(geom)
+      WHERE geom IS NOT NULL
+        AND NOT ST_IsEmpty(geom)
+        AND ST_Area(geom) > 4.0
     ), edges AS (
       SELECT
         ST_MakeLine(ST_PointN(ST_ExteriorRing(env), 1), ST_PointN(ST_ExteriorRing(env), 2)) AS e1,

@@ -195,7 +195,7 @@ BEGIN
   $SQL$, p_flag_col);
 
   EXECUTE v_sql INTO v_val_m2 USING p_city, p_geom;
-  RETURN (COALESCE(v_val_m2, 0.0) / v_area_m2) * 100.0;
+  RETURN LEAST(100.0, GREATEST(0.0, (COALESCE(v_val_m2, 0.0) / v_area_m2) * 100.0));
 END;
 $$;
 
@@ -224,7 +224,7 @@ BEGIN
     ON m.class_value = a.class_value
   WHERE lower(m.canonical_class) = lower(p_canonical);
 
-  RETURN (COALESCE(v_val_m2, 0.0) / v_area_m2) * 100.0;
+  RETURN LEAST(100.0, GREATEST(0.0, (COALESCE(v_val_m2, 0.0) / v_area_m2) * 100.0));
 END;
 $$;
 
@@ -278,7 +278,7 @@ BEGIN
   $SQL$, p_schema, p_table);
 
   EXECUTE v_sql INTO v_true_area_m2 USING v_geom_4326, p_true_value;
-  RETURN (COALESCE(v_true_area_m2, 0.0) / v_area_m2) * 100.0;
+  RETURN LEAST(100.0, GREATEST(0.0, (COALESCE(v_true_area_m2, 0.0) / v_area_m2) * 100.0));
 END;
 $$;
 
@@ -309,15 +309,24 @@ STABLE
 AS $$
 DECLARE
   v_h double precision;
+  v_total_m2 double precision;
 BEGIN
   SELECT
-    CASE
-      WHEN COALESCE(SUM(area_m2), 0.0) <= 0 THEN NULL
-      ELSE -SUM(CASE WHEN area_m2 > 0 THEN (area_m2 / SUM(area_m2) OVER ()) * LN(area_m2 / SUM(area_m2) OVER ()) ELSE 0 END)
-    END
+    SUM(area_m2)::double precision
+  INTO v_total_m2
+  FROM metrics._lulc_class_area_m2(p_city, p_geom)
+  WHERE area_m2 > 0;
+
+  IF v_total_m2 IS NULL OR v_total_m2 <= 0 THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT
+    -SUM((area_m2 / v_total_m2) * LN(area_m2 / v_total_m2))
   INTO v_h
   FROM metrics._lulc_class_area_m2(p_city, p_geom)
   WHERE area_m2 > 0;
+
   RETURN v_h;
 END;
 $$;
@@ -330,8 +339,39 @@ RETURNS double precision
 LANGUAGE plpgsql
 STABLE
 AS $$
+DECLARE
+  v_area_m2 double precision;
+  v_has_distinct_residential_proxy boolean;
+  v_residential_m2 double precision;
 BEGIN
-  RETURN metrics._lulc_flag_pct(p_city, p_geom, 'is_residential_proxy');
+  v_area_m2 := COALESCE(metrics._area_sqkm(p_geom), 0.0) * 1_000_000.0;
+  IF v_area_m2 <= 0 THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT EXISTS (
+    SELECT 1
+    FROM lulc.lulc_class_map
+    WHERE is_residential_proxy
+      AND NOT is_built_up
+  )
+  INTO v_has_distinct_residential_proxy;
+
+  -- Avoid returning a misleading duplicate of generic built-up cover when the
+  -- class map does not distinguish residential land use from built area.
+  IF NOT COALESCE(v_has_distinct_residential_proxy, false) THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT COALESCE(SUM(a.area_m2), 0.0)::double precision
+  INTO v_residential_m2
+  FROM metrics._lulc_class_area_m2(p_city, p_geom) a
+  JOIN lulc.lulc_class_map m
+    ON m.class_value = a.class_value
+  WHERE m.is_residential_proxy
+    AND NOT m.is_built_up;
+
+  RETURN LEAST(100.0, GREATEST(0.0, (COALESCE(v_residential_m2, 0.0) / v_area_m2) * 100.0));
 END;
 $$;
 
@@ -376,24 +416,37 @@ BEGIN
     v_sql := format($SQL$
       WITH clipped AS (
         SELECT
-          ST_Area(ST_Intersection(w.geom, $1)::geography)::double precision AS a
+          ST_CollectionExtract(
+            ST_MakeValid(ST_Intersection(w.geom, $1)),
+            3
+          ) AS geom
         FROM %I.%I w
         WHERE w.geom IS NOT NULL
           AND NOT ST_IsEmpty(w.geom)
           AND ST_Intersects(w.geom, $1)
+      ), unioned AS (
+        SELECT ST_UnaryUnion(ST_Collect(geom)) AS geom
+        FROM clipped
+        WHERE geom IS NOT NULL
+          AND NOT ST_IsEmpty(geom)
       )
-      SELECT COALESCE(SUM(a), 0)::double precision
-      FROM clipped
-      WHERE a > 0
+      SELECT
+        COALESCE(
+          ST_Area(ST_CollectionExtract((SELECT geom FROM unioned), 3)::geography),
+          0
+        )::double precision
     $SQL$, 'green', v_city || '_water_bodies_canonical');
     EXECUTE v_sql INTO v_poly_m2 USING v_geom_4326;
     v_poly_pct := (COALESCE(v_poly_m2, 0.0) / ST_Area(v_geom_4326::geography)) * 100.0;
   END IF;
 
   IF v_poly_pct IS NOT NULL THEN
-    RETURN v_poly_pct;
+    RETURN LEAST(100.0, GREATEST(0.0, v_poly_pct));
   END IF;
-  RETURN v_lulc_pct;
+  IF v_lulc_pct IS NULL THEN
+    RETURN NULL;
+  END IF;
+  RETURN LEAST(100.0, GREATEST(0.0, v_lulc_pct));
 END;
 $$;
 
@@ -411,10 +464,10 @@ DECLARE
   v_geom_3857 geometry;
   v_area_m2 double precision;
   v_lulc_built_m2 double precision := 0.0;
-  v_bldg_m2 double precision := 0.0;
-  v_road_m2 double precision := 0.0;
+  v_vector_impervious_m2 double precision := 0.0;
   v_sql text;
-  v_geom_u geometry;
+  v_has_bldg boolean;
+  v_has_roads boolean;
 BEGIN
   v_city := metrics._normalize_city(p_city);
   v_geom_4326 := metrics._normalize_polygon_geom(p_geom);
@@ -431,51 +484,139 @@ BEGIN
     ON m.class_value = a.class_value
   WHERE m.is_built_up IS TRUE;
 
-  IF to_regclass(format('%I.%I', 'buildings', v_city || '_buildings_normalized')) IS NOT NULL THEN
+  v_has_bldg := to_regclass(format('%I.%I', 'buildings', v_city || '_buildings_normalized')) IS NOT NULL;
+  v_has_roads := to_regclass(format('%I.%I', 'transport', v_city || '_roads_normalized')) IS NOT NULL;
+
+  IF v_has_bldg AND v_has_roads THEN
     v_sql := format($SQL$
-      WITH clipped AS (
-        SELECT ST_Area(ST_Intersection(b.geom, $2)::geography)::double precision AS a
+      WITH b AS (
+        SELECT
+          ST_CollectionExtract(
+            ST_MakeValid(ST_Intersection(metrics._to_3857(b.geom), $1)),
+            3
+          ) AS geom
         FROM %I.%I b
         WHERE b.geom IS NOT NULL
           AND NOT ST_IsEmpty(b.geom)
           AND ST_Intersects(metrics._to_3857(b.geom), $1)
-      )
-      SELECT COALESCE(SUM(a), 0)::double precision
-      FROM clipped
-      WHERE a > 0
-    $SQL$, 'buildings', v_city || '_buildings_normalized');
-    EXECUTE v_sql INTO v_bldg_m2 USING v_geom_3857, v_geom_4326;
-  END IF;
-
-  IF to_regclass(format('%I.%I', 'transport', v_city || '_roads_normalized')) IS NOT NULL THEN
-    v_sql := format($SQL$
-      WITH rb AS (
+      ),
+      rb AS (
         SELECT
-          ST_Buffer(
-            ST_CollectionExtract(
-              ST_MakeValid(ST_Intersection(metrics._to_3857(r.geom), $1)),
-              2
+          ST_CollectionExtract(
+            ST_MakeValid(
+              ST_Intersection(
+                ST_Buffer(
+                  ST_CollectionExtract(
+                    ST_MakeValid(ST_Intersection(metrics._to_3857(r.geom), $1)),
+                    2
+                  ),
+                  4.0
+                ),
+                $1
+              )
             ),
-            4.0
+            3
           ) AS geom
         FROM %I.%I r
         WHERE r.geom IS NOT NULL
           AND NOT ST_IsEmpty(r.geom)
           AND ST_Intersects(metrics._to_3857(r.geom), $1)
-      ), u AS (
+      ),
+      geoms AS (
+        SELECT geom FROM b WHERE geom IS NOT NULL AND NOT ST_IsEmpty(geom)
+        UNION ALL
+        SELECT geom FROM rb WHERE geom IS NOT NULL AND NOT ST_IsEmpty(geom)
+      ),
+      unioned AS (
+        SELECT ST_UnaryUnion(ST_Collect(geom)) AS geom
+        FROM geoms
+      )
+      SELECT
+        COALESCE(
+          ST_Area(
+            ST_Transform(
+              ST_CollectionExtract((SELECT geom FROM unioned), 3),
+              4326
+            )::geography
+          ),
+          0
+        )::double precision
+    $SQL$, 'buildings', v_city || '_buildings_normalized', 'transport', v_city || '_roads_normalized');
+    EXECUTE v_sql INTO v_vector_impervious_m2 USING v_geom_3857;
+  ELSIF v_has_bldg THEN
+    v_sql := format($SQL$
+      WITH b AS (
+        SELECT
+          ST_CollectionExtract(
+            ST_MakeValid(ST_Intersection(metrics._to_3857(b.geom), $1)),
+            3
+          ) AS geom
+        FROM %I.%I b
+        WHERE b.geom IS NOT NULL
+          AND NOT ST_IsEmpty(b.geom)
+          AND ST_Intersects(metrics._to_3857(b.geom), $1)
+      ),
+      u AS (
+        SELECT ST_UnaryUnion(ST_Collect(geom)) AS geom
+        FROM b
+        WHERE geom IS NOT NULL AND NOT ST_IsEmpty(geom)
+      )
+      SELECT
+        COALESCE(
+          ST_Area(
+            ST_Transform(
+              ST_CollectionExtract((SELECT geom FROM u), 3),
+              4326
+            )::geography
+          ),
+          0
+        )::double precision
+    $SQL$, 'buildings', v_city || '_buildings_normalized');
+    EXECUTE v_sql INTO v_vector_impervious_m2 USING v_geom_3857;
+  ELSIF v_has_roads THEN
+    v_sql := format($SQL$
+      WITH rb AS (
+        SELECT
+          ST_CollectionExtract(
+            ST_MakeValid(
+              ST_Intersection(
+                ST_Buffer(
+                  ST_CollectionExtract(
+                    ST_MakeValid(ST_Intersection(metrics._to_3857(r.geom), $1)),
+                    2
+                  ),
+                  4.0
+                ),
+                $1
+              )
+            ),
+            3
+          ) AS geom
+        FROM %I.%I r
+        WHERE r.geom IS NOT NULL
+          AND NOT ST_IsEmpty(r.geom)
+          AND ST_Intersects(metrics._to_3857(r.geom), $1)
+      ),
+      u AS (
         SELECT ST_UnaryUnion(ST_Collect(geom)) AS geom
         FROM rb
         WHERE geom IS NOT NULL AND NOT ST_IsEmpty(geom)
       )
-      SELECT (SELECT geom FROM u)
+      SELECT
+        COALESCE(
+          ST_Area(
+            ST_Transform(
+              ST_CollectionExtract((SELECT geom FROM u), 3),
+              4326
+            )::geography
+          ),
+          0
+        )::double precision
     $SQL$, 'transport', v_city || '_roads_normalized');
-    EXECUTE v_sql INTO v_geom_u USING v_geom_3857;
-    IF v_geom_u IS NOT NULL AND NOT ST_IsEmpty(v_geom_u) THEN
-      v_road_m2 := ST_Area(ST_Transform(v_geom_u, 4326)::geography);
-    END IF;
+    EXECUTE v_sql INTO v_vector_impervious_m2 USING v_geom_3857;
   END IF;
 
-  RETURN (LEAST(v_area_m2, GREATEST(COALESCE(v_lulc_built_m2, 0.0), COALESCE(v_bldg_m2, 0.0) + COALESCE(v_road_m2, 0.0))) / v_area_m2) * 100.0;
+  RETURN (LEAST(v_area_m2, GREATEST(COALESCE(v_lulc_built_m2, 0.0), COALESCE(v_vector_impervious_m2, 0.0))) / v_area_m2) * 100.0;
 END;
 $$;
 
@@ -524,20 +665,28 @@ BEGIN
   END IF;
 
   v_sql := format($SQL$
-    WITH p AS (
+    WITH clipped AS (
       SELECT
-        ST_Area(
-          ST_Intersection(g.geom, $1)::geography
-        )::double precision AS a
+        ST_CollectionExtract(
+          ST_MakeValid(ST_Intersection(g.geom, $1)),
+          3
+        ) AS geom
       FROM %I.%I g
       WHERE g.geom IS NOT NULL
         AND NOT ST_IsEmpty(g.geom)
         AND g.source_layer IN ('green_parks_vegetation', 'sports_play_open')
         AND ST_Intersects(g.geom, $1)
+    ), unioned AS (
+      SELECT ST_UnaryUnion(ST_Collect(geom)) AS geom
+      FROM clipped
+      WHERE geom IS NOT NULL
+        AND NOT ST_IsEmpty(geom)
     )
-    SELECT COALESCE(SUM(a), 0)::double precision
-    FROM p
-    WHERE a > 0
+    SELECT
+      COALESCE(
+        ST_Area(ST_CollectionExtract((SELECT geom FROM unioned), 3)::geography),
+        0
+      )::double precision
   $SQL$, 'green', v_city || '_open_spaces_normalized');
 
   EXECUTE v_sql INTO v_park_area_m2 USING v_geom_4326;
@@ -758,7 +907,7 @@ BEGIN
     RETURN NULL;
   END IF;
 
-  RETURN (COALESCE(v_num_m2, 0.0) / v_den_m2) * 100.0;
+  RETURN LEAST(100.0, GREATEST(0.0, (COALESCE(v_num_m2, 0.0) / v_den_m2) * 100.0));
 END;
 $$;
 

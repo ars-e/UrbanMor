@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="/Users/ars-e/projects/UrbanMor"
+ROOT="/Users/ars-e/projects/Morph"
 LOG="$ROOT/output/qa/ward_cache_refresh.log"
 mkdir -p "$ROOT/output/qa"
 

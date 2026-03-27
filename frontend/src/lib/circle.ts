@@ -24,7 +24,7 @@ export interface PreviewMetrics {
 }
 
 /**
- * Convert a circle (center + radius) to a 64-vertex polygon using Turf.js
+ * Convert a circle (center + radius) to a polygon using Turf.js
  *
  * @param center - [longitude, latitude]
  * @param radiusMeters - Radius in meters
@@ -37,9 +37,9 @@ export function createCirclePolygon(
   // Convert meters to kilometers for Turf
   const radiusKm = radiusMeters / 1000
 
-  // Create circle with 64 steps for smooth appearance
+  // 24 steps keeps circles smooth while reducing geometry complexity for faster analysis.
   const circleFeature = circle(center, radiusKm, {
-    steps: 64,
+    steps: 24,
     units: 'kilometers'
   })
 
